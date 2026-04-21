@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import matplotlib
+
+def is_notebook_environment() -> bool:
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+
+    shell = get_ipython()
+    return shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell"
+
+
+if not is_notebook_environment():
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import torch
+from PIL import Image
+from torch import Tensor, nn, optim
+from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
+from tqdm.auto import tqdm
+from torchvision import datasets, models, transforms
+from torchvision.transforms import functional as TF
+from torchvision.models import Inception_V3_Weights
+from matplotlib.figure import Figure
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR / "ml_bootcamp_adsafety_dataset"
+CLASS_NAMES = ["safe", "unsafe"]
+IMAGE_SIZE = 299
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_EPOCHS = 3
+DEFAULT_LR = 1e-4
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_MODEL_WEIGHTS = Inception_V3_Weights.IMAGENET1K_V1
+MODEL_PREPROCESS = DEFAULT_MODEL_WEIGHTS.transforms()
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    epochs: int = DEFAULT_EPOCHS
+    patience: int = 5
+    batch_size: int = DEFAULT_BATCH_SIZE
+    learning_rate: float = DEFAULT_LR
+    adversarial: bool = False
+    adv_epsilon: float = 0.15
+    adv_steps: int = 20
+
+
+IMAGE_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+    ]
+)
+NORMALIZE_TRANSFORM = transforms.Normalize(
+    mean=MODEL_PREPROCESS.mean,
+    std=MODEL_PREPROCESS.std,
+)
+
+
+def make_seed() -> int:
+    return random.SystemRandom().randrange(2**32)
+
+
+def get_default_batch_size(device: torch.device = DEVICE) -> int:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return DEFAULT_BATCH_SIZE
+
+    total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    if total_vram_gb >= 32:
+        return 256
+    if total_vram_gb >= 16:
+        return 128
+    if total_vram_gb >= 8:
+        return 64
+    return DEFAULT_BATCH_SIZE
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_logits(outputs: Tensor | object) -> Tensor:
+    return outputs.logits if hasattr(outputs, "logits") else outputs
+
+
+def forward_logits(model: nn.Module, images: Tensor) -> Tensor:
+    normalized_images = NORMALIZE_TRANSFORM(images)
+    return get_logits(model(normalized_images))
+
+
+def to_device(*tensors: Tensor, device: torch.device = DEVICE) -> tuple[Tensor, ...]:
+    return tuple(tensor.to(device) for tensor in tensors)
+
+
+def make_data_loader(*datasets_list, batch_size: int, shuffle: bool) -> tuple[DataLoader, ...]:
+    return tuple(
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            pin_memory=torch.cuda.is_available(),
+        )
+        for dataset in datasets_list
+    )
+
+
+def evaluate_accuracy(model: nn.Module, data_loader: DataLoader, split_name: str) -> float:
+    model.eval()
+    total_correct = 0
+
+    with torch.inference_mode():
+        for images, labels in tqdm(
+            data_loader,
+            desc=f"Evaluating ({split_name})",
+            leave=False,
+        ):
+            images, labels = to_device(images, labels)
+            logits = forward_logits(model, images)
+            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+
+    return total_correct / len(data_loader.dataset)
+
+def train_model_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    epoch_type: str,
+) -> float:
+    model.train()
+    total_loss = 0.0
+
+    for images, labels in tqdm(
+        train_loader,
+        desc=f"Training ({epoch_type})",
+        leave=False,
+    ):
+        images, labels = to_device(images, labels)
+        optimizer.zero_grad(set_to_none=True)
+        logits = forward_logits(model, images)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    return total_loss / len(train_loader)
+
+
+def generate_adversarial_loader(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion: nn.Module,
+    epsilon: float,
+    num_steps: int,
+) -> DataLoader:
+    print(
+        f"Generating adversarial examples from train dataset "
+        f"(epsilon={epsilon}, steps={num_steps})..."
+    )
+    adversarial_images: list[Tensor] = []
+    adversarial_labels: list[Tensor] = []
+
+    for images, labels in tqdm(
+        train_loader,
+        desc="Adversarial batches",
+        leave=False,
+    ):
+        images, labels = to_device(images, labels)
+        adv_images = generate_adversarial_perturbation(
+            model=model,
+            x_original=images,
+            criterion=criterion,
+            target_labels=labels,
+            epsilon=epsilon,
+            num_steps=num_steps,
+        )
+        adversarial_images.append(adv_images.cpu())
+        adversarial_labels.append(labels.cpu())
+
+    adv_dataset = TensorDataset(
+        torch.cat(adversarial_images, dim=0),
+        torch.cat(adversarial_labels, dim=0),
+    )
+    adv_loader, = make_data_loader(
+        adv_dataset,
+        batch_size=train_loader.batch_size or DEFAULT_BATCH_SIZE,
+        shuffle=True,
+    )
+    return adv_loader
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    config: TrainingConfig,
+    best_model_path: Path,
+) -> None:
+    print("Starting training.")
+    best_combined_accuracy = float("-inf")
+    best_epoch = 0
+    patience_counter = 0
+    start_time = time.time()
+    best_model_path = Path(best_model_path)
+
+    for epoch in range(1, config.epochs + 1):
+        avg_train_loss = train_model_epoch(model, train_loader, optimizer, criterion, "train")
+        avg_adv_train_loss = 0.0
+        adv_loader: DataLoader | None = None
+
+        accuracy_loaders = [train_loader, val_loader]
+        combined_split_name = "train+val"
+
+        if config.adversarial:
+            adv_loader = generate_adversarial_loader(
+                model=model,
+                train_loader=train_loader,
+                criterion=criterion,
+                epsilon=config.adv_epsilon,
+                num_steps=config.adv_steps,
+            )
+            avg_adv_train_loss = train_model_epoch(
+                model, adv_loader, optimizer, criterion, "adversarial"
+            )
+            accuracy_loaders.append(adv_loader)
+            combined_split_name += "+adv"
+
+        combined_dataset = ConcatDataset([loader.dataset for loader in accuracy_loaders])
+        combined_loader, = make_data_loader(
+            combined_dataset,
+            batch_size=train_loader.batch_size or config.batch_size,
+            shuffle=False,
+        )
+        accuracy = evaluate_accuracy(
+            model,
+            combined_loader,
+            combined_split_name,
+        )
+        elapsed = time.time() - start_time
+        log_parts = [
+            f"Epoch {epoch}/{config.epochs}",
+            f"train={avg_train_loss:.4f}",
+            f"accuracy={accuracy:.4f}",
+        ]
+        if config.adversarial:
+            log_parts.extend(
+                [
+                    f"adv_train={avg_adv_train_loss:.4f}",
+                ]
+            )
+        log_parts.extend(
+            [
+                f"best={best_combined_accuracy:.4f} @ epoch {best_epoch}",
+                f"time={elapsed:.2f}s",
+            ]
+        )
+
+        print(" | ".join(log_parts))
+
+        if accuracy >= best_combined_accuracy:
+            best_combined_accuracy = accuracy
+            best_epoch = epoch
+            patience_counter = 0
+            save_model(model, best_model_path)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= config.patience:
+            print(f"Early stopping at epoch {epoch} (patience={config.patience})")
+            break
+
+    if patience_counter > 0:
+        reload_model(model, best_model_path)
+        print(
+            f"Loaded best model from epoch {best_epoch} "
+            f"(combined accuracy: {best_combined_accuracy:.4f})"
+        )
+    else:
+        print(
+            f"Best model already in memory from epoch {best_epoch} "
+            f"(combined accuracy: {best_combined_accuracy:.4f})"
+        )
+
+
+def save_model(model: nn.Module, filename: Path) -> None:
+    filename = Path(filename)
+    tmp_filename = filename.with_name(f"{filename.name}.tmp")
+    print(f"Saving model to {filename}...")
+
+    tmp_filename.unlink(missing_ok=True)
+    try:
+        torch.save(model.state_dict(), tmp_filename)
+        os.replace(tmp_filename, filename)
+    except Exception:
+        tmp_filename.unlink(missing_ok=True)
+        raise
+
+
+def make_model(weights: Inception_V3_Weights | None = DEFAULT_MODEL_WEIGHTS) -> nn.Module:
+    print("Creating model...")
+    model = models.inception_v3(weights=weights, init_weights=False)
+    model.fc = nn.Linear(model.fc.in_features, len(CLASS_NAMES))
+    if model.AuxLogits is not None:
+        model.AuxLogits.fc = nn.Linear(model.AuxLogits.fc.in_features, len(CLASS_NAMES))
+    return model.to(DEVICE)
+
+
+def reload_model(model: nn.Module, filename: Path) -> None:
+    state_dict = torch.load(filename, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+
+
+def load_model(filename: Path) -> nn.Module:
+    print(f"Loading model from {filename}...")
+    loaded_model = make_model(weights=None)
+    reload_model(loaded_model, filename)
+    loaded_model.eval()
+    return loaded_model
+
+
+def generate_adversarial_perturbation(
+    model: nn.Module,
+    x_original: Tensor,
+    criterion: nn.Module,
+    target_labels: Tensor | None = None,
+    epsilon: float = 0.15,
+    num_steps: int = 40,
+) -> Tensor:
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+
+    x_adv = x_original.detach().clone()
+    step_size = epsilon / num_steps
+
+    if target_labels is None:
+        with torch.no_grad():
+            target_labels = forward_logits(model, x_original).argmax(dim=1)
+    else:
+        target_labels = target_labels.to(x_original.device)
+
+    was_training = model.training
+    model.eval()
+
+    for _ in range(num_steps):
+        x_adv.requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        logits = forward_logits(model, x_adv)
+        loss = criterion(logits, target_labels)
+        grad = torch.autograd.grad(loss, x_adv)[0]
+
+        with torch.no_grad():
+            x_adv = x_adv + step_size * grad.sign()
+            x_adv = torch.clamp(x_adv, x_original - epsilon, x_original + epsilon)
+            x_adv = torch.clamp(x_adv, 0.0, 1.0)
+            x_adv = x_adv.detach()
+
+    model.train(was_training)
+    return x_adv
+
+
+def evaluate_samples(model: nn.Module, *samples: Tensor) -> tuple[tuple[Tensor, Tensor], ...]:
+    model.eval()
+    evaluations: list[tuple[Tensor, Tensor]] = []
+
+    with torch.inference_mode():
+        for sample in samples:
+            logits = forward_logits(model, sample)
+            probs = torch.softmax(logits, dim=1)
+            preds = logits.argmax(dim=1)
+            confs = probs.gather(1, preds.unsqueeze(1)).squeeze(1)
+            evaluations.append((preds, confs))
+
+    return tuple(evaluations)
+
+
+def generate_target_class_image(
+    model: nn.Module,
+    x_initial: Tensor,
+    criterion: nn.Module,
+    target_label: int,
+    step_size: float = 0.01,
+    num_steps: int = 80,
+) -> Tensor:
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+
+    x_target = TF.gaussian_blur(x_initial.detach().clone(), kernel_size=9)
+    target_labels = torch.tensor([target_label], device=x_initial.device)
+    was_training = model.training
+    model.eval()
+
+    for _ in range(num_steps):
+        x_target.requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        logits = forward_logits(model, x_target)
+        loss = criterion(logits, target_labels)
+        grad = torch.autograd.grad(loss, x_target)[0]
+
+        with torch.no_grad():
+            # Gradient descent on the target-class loss nudges the image toward that class.
+            x_target = x_target - step_size * grad.sign()
+            x_target = torch.clamp(x_target, 0.0, 1.0)
+            x_target = TF.gaussian_blur(x_target, kernel_size=9).detach()
+
+    model.train(was_training)
+    return x_target
+
+
+def make_random_image_tensor() -> Tensor:
+    return torch.rand((1, 3, IMAGE_SIZE, IMAGE_SIZE), device=DEVICE)
+
+
+def save_figure(fig: Figure, output_path: Path) -> None:
+    output_path = Path(output_path)
+    fig.savefig(output_path, dpi=100, bbox_inches="tight")
+    print(f"Figure saved to {output_path}")
+
+
+def generate_adversarial_example(
+    model: nn.Module,
+    sample_dataset: datasets.ImageFolder,
+    epsilon: float = 0.15,
+    num_steps: int = 40,
+) -> Figure:
+    criterion = nn.CrossEntropyLoss()
+    if len(sample_dataset) == 0:
+        raise ValueError("Sample dataset is empty")
+
+    sample_index = random.randrange(len(sample_dataset))
+    image_tensor, label_idx = sample_dataset[sample_index]
+    original_tensor = image_tensor.unsqueeze(0).to(DEVICE)
+    true_label = sample_dataset.classes[label_idx]
+    print(f"Using sample index: {sample_index}")
+
+    adversarial_tensor = generate_adversarial_perturbation(
+        model=model,
+        x_original=original_tensor,
+        criterion=criterion,
+        target_labels=torch.tensor([CLASS_NAMES.index(true_label)], device=DEVICE),
+        epsilon=epsilon,
+        num_steps=num_steps,
+    )
+    (orig_preds, orig_confs), (adv_preds, adv_confs) = evaluate_samples(
+        model, original_tensor, adversarial_tensor
+    )
+
+    original_img_np = image_tensor.permute(1, 2, 0).numpy()
+    adversarial_img_np = adversarial_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].imshow(original_img_np)
+    axes[0].set_title(
+        f"Original: {true_label}\nPred: {CLASS_NAMES[orig_preds[0]]} ({orig_confs[0]:.3f})"
+    )
+    axes[0].axis("off")
+
+    axes[1].imshow(adversarial_img_np)
+    axes[1].set_title(
+        f"Adversarial\nPred: {CLASS_NAMES[adv_preds[0]]} ({adv_confs[0]:.3f})"
+    )
+    axes[1].axis("off")
+
+    fig.tight_layout()
+    plt.close(fig)
+    print(f"  True label: {true_label}")
+    print(f"  Original prediction: {CLASS_NAMES[orig_preds[0]]} (confidence: {orig_confs[0]:.3f})")
+    print(f"  Adversarial prediction: {CLASS_NAMES[adv_preds[0]]} (confidence: {adv_confs[0]:.3f})")
+    print(f"  Attack successful: {orig_preds[0] != adv_preds[0]}")
+    return fig
+
+
+def generate_class_reversal_figure(
+    model: nn.Module,
+    step_size: float = 0.01,
+    num_steps: int = 80,
+) -> Figure:
+    criterion = nn.CrossEntropyLoss()
+    print("Generating class reversal figure from random pixel initialization...")
+
+    fig, axes = plt.subplots(1, len(CLASS_NAMES), figsize=(6 * len(CLASS_NAMES), 5))
+    if len(CLASS_NAMES) == 1:
+        axes = [axes]
+
+    initial_tensor = make_random_image_tensor()
+
+    for idx, class_name in enumerate(CLASS_NAMES):
+        generated_tensor = generate_target_class_image(
+            model=model,
+            x_initial=initial_tensor,
+            criterion=criterion,
+            target_label=idx,
+            step_size=step_size,
+            num_steps=num_steps,
+        )
+        with torch.inference_mode():
+            logits = forward_logits(model, generated_tensor)
+            probs = torch.softmax(logits, dim=1)
+            pred = probs.argmax(dim=1).item()
+            confidence = probs[0, pred].item()
+        generated_img_np = generated_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
+
+        axes[idx].imshow(generated_img_np)
+        axes[idx].set_title(
+            f"Target: {class_name}\nPred: {CLASS_NAMES[pred]} ({confidence:.3f})"
+        )
+        axes[idx].axis("off")
+
+    fig.tight_layout()
+    plt.close(fig)
+    return fig
+
+
+def generate_test_figure(
+    model: nn.Module,
+    sample_dataset: datasets.ImageFolder,
+) -> Figure:
+    if len(sample_dataset) == 0:
+        raise ValueError("Sample dataset is empty")
+
+    sample_index = random.randrange(len(sample_dataset))
+    model.eval()
+    image_tensor, label_idx = sample_dataset[sample_index]
+    input_tensor = image_tensor.unsqueeze(0).to(DEVICE)
+
+    with torch.inference_mode():
+        logits = forward_logits(model, input_tensor)
+        probs = torch.softmax(logits, dim=1)
+        pred = probs.argmax(dim=1).item()
+        confidence = probs[0, pred].item()
+
+    true_label = sample_dataset.classes[label_idx]
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(image_tensor.permute(1, 2, 0).numpy())
+    ax.set_title(f"True: {true_label}, Pred: {CLASS_NAMES[pred]} ({confidence:.3f})")
+    ax.axis("off")
+    fig.tight_layout()
+    plt.close(fig)
+    return fig
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train ad safety classifier with optional adversarial training."
+    )
+    parser.add_argument("--model-path", type=str, default=None, help="Load a pre-trained model")
+    parser.add_argument("--adversarial", action="store_true", help="Enable adversarial training")
+    parser.add_argument("--adv-epsilon", type=float, default=0.15, help="Adversarial perturbation magnitude")
+    parser.add_argument("--adv-steps", type=int, default=20, help="Attack iterations for adversarial batches")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=None, help="Training batch size")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed. Defaults to a random value per run")
+    return parser.parse_args()
+
+
+def build_training_config(args: argparse.Namespace) -> TrainingConfig:
+    batch_size = args.batch_size if args.batch_size is not None else get_default_batch_size()
+
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.adv_steps < 0:
+        raise ValueError("--adv-steps must be non-negative")
+    if args.adv_epsilon < 0:
+        raise ValueError("--adv-epsilon must be non-negative")
+
+    return TrainingConfig(
+        epochs=args.epochs,
+        batch_size=batch_size,
+        adversarial=args.adversarial,
+        adv_epsilon=args.adv_epsilon,
+        adv_steps=args.adv_steps,
+    )
+
+
+def load_datasets(*split_names: str) -> tuple[datasets.ImageFolder, ...]:
+    print(f"Loading datasets from {DATA_DIR}...")
+    datasets_by_split: list[datasets.ImageFolder] = []
+
+    for split_name in split_names:
+        split_dir = DATA_DIR / split_name
+        if not split_dir.is_dir():
+            raise FileNotFoundError(f"Dataset directory does not exist: {split_dir}")
+        if not any(path.is_file() for path in split_dir.glob("*/*")):
+            raise ValueError(f"Dataset directory has no samples: {split_dir}")
+
+        datasets_by_split.append(datasets.ImageFolder(split_dir, transform=IMAGE_TRANSFORM))
+
+    return tuple(datasets_by_split)
+
+
+def resolve_model_path(model_path_arg: str | None) -> Path | None:
+    if model_path_arg is None:
+        return None
+
+    model_path = Path(model_path_arg)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Specified model path does not exist: {model_path}")
+    return model_path
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_training_config(args)
+    run_timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    seed = args.seed if args.seed is not None else make_seed()
+    set_seed(seed)
+
+    model_path = resolve_model_path(args.model_path)
+    print(f"Using device: {DEVICE}")
+    print(f"Using seed: {seed}")
+    print(f"Using batch size: {config.batch_size}")
+
+    train_dataset, val_dataset, test_dataset = load_datasets("train", "val", "test")
+    train_loader, = make_data_loader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader, test_loader = make_data_loader(
+        val_dataset,
+        test_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+    )
+
+    if model_path is not None:
+        model = load_model(model_path)
+        print(f"Loaded model from: {model_path}")
+        print("Skipping training. Running test and adversarial demo.")
+        train_accuracy = evaluate_accuracy(model, train_loader, "train")
+        print(f"Train accuracy: {train_accuracy:.4f}")
+        val_accuracy = evaluate_accuracy(model, val_loader, "val")
+        print(f"Validation accuracy: {val_accuracy:.4f}")
+    else:
+        model = make_model()
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+        model_path = SCRIPT_DIR / f"{run_timestamp}-model.pth"
+        train_model(model, train_loader, val_loader, optimizer, criterion, config, model_path)
+
+    test_accuracy = evaluate_accuracy(model, test_loader, "test")
+    print(f"Test accuracy: {test_accuracy:.4f}")
+
+    print("\nGenerating test example...")
+    save_figure(
+        generate_test_figure(
+            model=model,
+            sample_dataset=test_dataset,
+        ),
+        SCRIPT_DIR / f"{run_timestamp}-test.png",
+    )
+
+    print("\nGenerating adversarial attack example...")
+    save_figure(
+        generate_adversarial_example(
+            model=model,
+            sample_dataset=train_dataset,
+            epsilon=config.adv_epsilon,
+            num_steps=max(config.adv_steps, 1),
+        ),
+        SCRIPT_DIR / f"{run_timestamp}_adversarial.png",
+    )
+
+    print("\nGenerating class reversal figure...")
+    save_figure(
+        generate_class_reversal_figure(
+            model=model,
+        ),
+        SCRIPT_DIR / f"{run_timestamp}_class_reversal.png",
+    )
+
+
+if __name__ == "__main__":
+    main()
