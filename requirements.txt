@@ -1,0 +1,10 @@
+# Third-party dependencies inferred from imports in challenge code and notebooks
+
+ipython
+matplotlib
+nvidia-ml-py
+scikit-learn
+torch
+torchvision
+tqdm
+transformers
