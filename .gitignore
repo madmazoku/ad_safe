@@ -12,23 +12,9 @@ __pycache__/
 venv/
 .venv/
 
-# Runtime datasets and generated artifacts.
-# Keep directory placeholders only; local contents are not source.
-datasets/**
-!datasets/
-!datasets/.gitkeep
-
-artefacts/**
-!artefacts/
-!artefacts/.gitkeep
-!artefacts/ad_safe_runs/
-!artefacts/ad_safe_runs/.gitkeep
-!artefacts/prod_models/
-!artefacts/prod_models/.gitkeep
-!artefacts/smoke_models/
-!artefacts/smoke_models/.gitkeep
-!artefacts/sweep_configs/
-!artefacts/sweep_configs/.gitkeep
+# Runtime datasets and generated artifacts are local-only.
+datasets/
+artefacts/
 
 # Atomic save temp files for checkpoints and ad-hoc local output
 *.tmp
