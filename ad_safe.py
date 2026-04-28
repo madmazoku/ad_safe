@@ -12,7 +12,7 @@ import ad_safe_lib as ad_safe
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ad safety classifier with optional adversarial training."
+        description="Train ad safety classifier."
     )
     parser.add_argument("--list-base-models", action="store_true", help="List supported base models and exit")
     parser.add_argument("--setup", type=str, default=argparse.SUPPRESS, help="Load run configuration from a setup JSON file")
@@ -40,9 +40,6 @@ def parse_args() -> argparse.Namespace:
         default=argparse.SUPPRESS,
         help="Comma-separated backbone block names to unfreeze in addition to the classification head",
     )
-    parser.add_argument("--adversarial", action="store_true", default=argparse.SUPPRESS, help="Enable adversarial training")
-    parser.add_argument("--adv-epsilon", type=float, default=argparse.SUPPRESS, help="Adversarial perturbation magnitude")
-    parser.add_argument("--adv-steps", type=int, default=argparse.SUPPRESS, help="Attack iterations for adversarial batches")
     parser.add_argument("--teacher-model-path", type=str, default=argparse.SUPPRESS, help="Optional checkpoint to use as a frozen teacher during training")
     parser.add_argument("--distillation-alpha", type=float, default=argparse.SUPPRESS, help="Weight for teacher KL loss when --teacher-model-path is provided")
     parser.add_argument("--distillation-temperature", type=float, default=argparse.SUPPRESS, help="Softmax temperature for teacher distillation")
@@ -132,7 +129,7 @@ def build_run_plan(
         job_index=0,
         phase_index=0,
         prefix=run_id,
-        name="main",
+        title="main",
         requested_seed=seed,
         config=config,
         unfreeze_all=unfreeze_all,
@@ -152,7 +149,7 @@ def build_run_plan(
             ad_safe.JobSpec(
                 job_index=0,
                 job_id="main",
-                display_name=config.base_model,
+                title=config.base_model,
                 backbone=config.base_model,
                 phases=(phase,),
                 initial_model_path=original_model_path,
@@ -191,8 +188,6 @@ def main() -> None:
     setup_path = resolve_setup_path(cli_values.get("setup"))
     setup_values = ad_safe.load_setup_values(setup_path) if setup_path is not None else {}
     merged_values = ad_safe.merge_setup_and_cli_values(cli_values, setup_values)
-    if merged_values["model_path"] is not None and bool(merged_values["model_path_last"]):
-        raise ValueError("Use only one of --model-path or --model-path-last")
 
     config = ad_safe.build_training_config(merged_values)
     config = replace(
@@ -208,9 +203,8 @@ def main() -> None:
     )
     seed = ad_safe.resolve_effective_seed(merged_values["seed"])
     ad_safe.set_seed(seed)
-    train_split = None if merged_values["train_split"] is None else str(merged_values["train_split"])
+    train_split = merged_values["train_split"]
     eval_split = merged_values["eval_split"] or train_split
-    eval_split = None if eval_split is None else str(eval_split)
     train_fraction = validate_fraction(merged_values["train_fraction"], field_name="--train-fraction")
     unfreeze_all = bool(merged_values["unfreeze_all"])
     unfreeze_top = int(merged_values["unfreeze_top"])
@@ -272,7 +266,7 @@ def main() -> None:
                 models=(
                     ad_safe.ModelEvalSpec(
                         path=final_model_path,
-                        row_id=final_model_path.name,
+                        title=final_model_path.name,
                     ),
                 ),
                 datasets=(ad_safe.DatasetEvalSpec(name=eval_split, batch_size=config.batch_size),),

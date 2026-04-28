@@ -22,15 +22,15 @@ from .reporting import (
 @dataclass(frozen=True)
 class ModelEvalSpec:
     path: Path
-    name: str | None = None
-    row_id: str | None = None
+    title: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
-    def display_name(self) -> str:
-        return self.name or self.path.name
+    def __post_init__(self) -> None:
+        if self.title is None:
+            object.__setattr__(self, 'title', self.path.name)
 
-    def display_row_id(self) -> str:
-        return self.row_id or self.display_name()
+    def display_title(self) -> str:
+        return self.title or self.path.name
 
 
 @dataclass(frozen=True)
@@ -105,7 +105,7 @@ def run_evaluation_plan(plan: EvaluationPlan) -> EvaluationRunResult:
 
     rows: list[MetricsMatrixRow] = []
     for model_spec in plan.models:
-        print(f"\nEvaluating {model_spec.display_name()}...")
+        print(f"\nEvaluating {model_spec.display_title()}...")
         model = load_model(model_spec.path)
         metrics_by_dataset: dict[str, ClassificationMetrics] = {}
         for dataset_spec in plan.datasets:
@@ -118,10 +118,10 @@ def run_evaluation_plan(plan: EvaluationPlan) -> EvaluationRunResult:
             print(f"{dataset_spec.name}: {metrics}")
         rows.append(
             MetricsMatrixRow(
-                row_id=model_spec.display_row_id(),
+                row_id=model_spec.display_title(),
                 metrics_by_dataset=metrics_by_dataset,
                 metadata={
-                    "model_name": model_spec.display_name(),
+                    "model_name": model_spec.display_title(),
                     "model_path": str(model_spec.path.resolve()),
                     **model_spec.metadata,
                 },

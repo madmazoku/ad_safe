@@ -12,28 +12,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from .artifacts import load_model, save_model
+from .artifacts import load_model, release_torch_memory, save_model
 from .backbones import forward_logits
 from .config import CLASS_NAMES, DEFAULT_ADV_STEPS, DEVICE, TrainingConfig, TrainingHistoryEntry, get_learning_rate_for_split
 from .cooldown import EpochEndHandler
 from .data import LabeledDatasetView, PreparedTrainingDataset, make_data_loader, split_train_dataset, to_device
+from .enrichment import EnrichmentJobSpec, run_enrichment_jobs
 from .metrics import DefaultValidationMetricComparator, ValidationComparison, evaluate_validation_score
-
-
-@dataclass(frozen=True)
-class AdversarialPerturbationResult:
-    adversarial_tensor: Tensor
-    epsilon: float
-    attack_success: bool
-    original_prediction: int
-    original_confidence: float
-    original_true_confidence: float
-    prediction: int
-    confidence: float
-    true_confidence: float
-    linf: float
-    rms: float
-    mae: float
 
 
 def compute_distillation_loss(
@@ -122,91 +107,10 @@ def precompute_teacher_logits(
     return torch.cat(logits_batches, dim=0).to(DEVICE)
 
 
-def extend_dataset_with_adversarial_samples(
-    *,
-    model: nn.Module,
-    dataset: PreparedTrainingDataset,
-    criterion: nn.Module,
-    config: TrainingConfig,
-) -> int:
-    if config.adv_steps <= 0:
-        raise ValueError("adv_steps must be positive when adversarial training is enabled")
-
-    data_loader, = make_data_loader(
-        dataset.dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-    )
-    added_count = 0
-    seen_count = 0
-    correct_count = 0
-    was_training = model.training
-    model.eval()
-
-    for images, labels in tqdm(data_loader, desc="Adversarial dataset", leave=False):
-        images, labels = to_device(images, labels)
-        batch_size = images.shape[0]
-        with torch.inference_mode():
-            clean_logits = forward_logits(model, images)
-            clean_predictions = clean_logits.argmax(dim=1)
-        correct_mask = clean_predictions == labels
-        correct_count += int(correct_mask.sum().item())
-
-        if correct_mask.any():
-            correct_images = images[correct_mask]
-            correct_labels = labels[correct_mask]
-            source_indices = torch.arange(
-                seen_count,
-                seen_count + batch_size,
-                device=labels.device,
-            )[correct_mask]
-            adversarial_images = generate_adversarial_perturbation(
-                model=model,
-                x_original=correct_images,
-                criterion=criterion,
-                target_labels=correct_labels,
-                strategy=BudgetedPgdStrategy(
-                    epsilon=config.adv_epsilon,
-                    num_steps=config.adv_steps,
-                ),
-            )
-            with torch.inference_mode():
-                adversarial_logits = forward_logits(model, adversarial_images)
-                adversarial_predictions = adversarial_logits.argmax(dim=1)
-            successful_mask = adversarial_predictions != correct_labels
-
-            for image, label, source_index in zip(
-                adversarial_images[successful_mask],
-                correct_labels[successful_mask],
-                source_indices[successful_mask],
-                strict=True,
-            ):
-                teacher_logits = (
-                    dataset.get_teacher_logits(int(source_index.item()))
-                )
-                dataset.add_sample(
-                    image=image,
-                    label=int(label.item()),
-                    teacher_logits=teacher_logits,
-                )
-                added_count += 1
-
-        seen_count += batch_size
-
-    model.train(was_training)
-    print(
-        "Adversarial dataset extension: "
-        f"clean={seen_count}, correct={correct_count}, added={added_count}"
-    )
-    return added_count
-
-
 def prepare_training_dataset(
     *,
-    model: nn.Module,
     full_train_dataset: Dataset,
     config: TrainingConfig,
-    criterion: nn.Module,
 ) -> PreparedTrainingDataset:
     prepared_dataset = PreparedTrainingDataset(full_train_dataset)
     teacher_logits = precompute_teacher_logits(
@@ -221,13 +125,6 @@ def prepare_training_dataset(
         print(f"Distillation alpha: {config.distillation_alpha}")
         print(f"Distillation temperature: {config.distillation_temperature}")
 
-    if config.adversarial:
-        extend_dataset_with_adversarial_samples(
-            model=model,
-            dataset=prepared_dataset,
-            criterion=criterion,
-            config=config,
-        )
     return prepared_dataset
 
 
@@ -424,83 +321,25 @@ def train_model(
     return model, history
 
 
-def train_model_across_resplits(
-    *,
-    model: nn.Module,
-    full_train_dataset: Dataset,
-    config: TrainingConfig,
-    best_model_path: Path,
-    criterion: nn.Module | None = None,
-    training_start_time: float | None = None,
-    split_log_prefix: str = "",
-    epoch_end_handlers: tuple[EpochEndHandler, ...] = (),
-) -> tuple[nn.Module, list[TrainingHistoryEntry]]:
-    criterion = nn.CrossEntropyLoss() if criterion is None else criterion
-    prepared_train_dataset = prepare_training_dataset(
-        model=model,
-        full_train_dataset=full_train_dataset,
-        config=config,
-        criterion=criterion,
-    )
-    training_start_time = time.time() if training_start_time is None else training_start_time
-    history: list[TrainingHistoryEntry] = []
-    completed_epochs = 0
-    split_prefix = f"{split_log_prefix} " if split_log_prefix else ""
-
-    for split_round in range(1, config.resplit_runs + 1):
-        print(f"\n{split_prefix}Split round {split_round}/{config.resplit_runs}")
-        train_dataset, val_dataset, test_dataset = split_train_dataset(prepared_train_dataset)
-        train_loader, = make_data_loader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            pin_memory=(
-                False
-                if prepared_train_dataset.teacher_logits is not None
-                and prepared_train_dataset.teacher_logits.device.type == "cuda"
-                else None
-            ),
-        )
-        val_loader, = make_data_loader(
-            LabeledDatasetView(val_dataset),
-            batch_size=config.batch_size,
-            shuffle=False,
-        )
-        print(f"Train samples: {len(train_dataset)}")
-        print(f"Val samples: {len(val_dataset)}")
-        print(f"Test samples: {len(test_dataset)}")
-        split_learning_rate = get_learning_rate_for_split(config, split_round)
-        print(f"Learning rate for split {split_round}: {split_learning_rate}")
-
-        optimizer = optim.Adam(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            lr=split_learning_rate,
-        )
-        model, round_history = train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            config=config,
-            best_model_path=best_model_path,
-            split_round=split_round,
-            global_epoch_start=completed_epochs,
-            training_start_time=training_start_time,
-            epoch_end_handlers=epoch_end_handlers,
-        )
-        history.extend(round_history)
-        completed_epochs += sum(1 for entry in round_history if not entry.is_baseline)
-
-    return model, history
-
-
 class AdversarialAttackStrategy(Protocol):
-    def run(self, context: "AdversarialAttackContext") -> Tensor:
-        raise NotImplementedError
-
     def run_with_result(self, context: "AdversarialAttackContext") -> AdversarialPerturbationResult:
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class AdversarialPerturbationResult:
+    adversarial_tensor: Tensor
+    epsilon: float
+    attack_success: bool
+    original_prediction: int
+    original_confidence: float
+    original_true_confidence: float
+    prediction: int
+    confidence: float
+    true_confidence: float
+    linf: float
+    rms: float
+    mae: float
 
 
 @dataclass(frozen=True)
@@ -727,8 +566,7 @@ def generate_adversarial_perturbation(
     criterion: nn.Module,
     target_labels: Tensor | None = None,
     strategy: AdversarialAttackStrategy | None = None,
-    return_result: bool = False,
-) -> Tensor | AdversarialPerturbationResult:
+) -> AdversarialPerturbationResult:
     if target_labels is None:
         raise ValueError("target_labels must be provided for adversarial perturbation")
 
@@ -739,6 +577,105 @@ def generate_adversarial_perturbation(
         criterion=criterion,
         target_labels=target_labels,
     )
-    if return_result:
-        return attack_strategy.run_with_result(context)
-    return attack_strategy.run(context)
+    return attack_strategy.run_with_result(context)
+
+
+def train_model_across_resplits(
+    *,
+    model: nn.Module,
+    full_train_dataset: Dataset,
+    config: TrainingConfig,
+    best_model_path: Path,
+    criterion: nn.Module | None = None,
+    training_start_time: float | None = None,
+    split_log_prefix: str = "",
+    epoch_end_handlers: tuple[EpochEndHandler, ...] = (),
+    enrichment_jobs: tuple[EnrichmentJobSpec, ...] = (),
+    teacher_model: nn.Module | None = None,
+) -> tuple[nn.Module, list[TrainingHistoryEntry]]:
+    criterion = nn.CrossEntropyLoss() if criterion is None else criterion
+    prepared_train_dataset = prepare_training_dataset(
+        full_train_dataset=full_train_dataset,
+        config=config,
+    )
+    training_start_time = time.time() if training_start_time is None else training_start_time
+    history: list[TrainingHistoryEntry] = []
+    completed_epochs = 0
+    split_prefix = f"{split_log_prefix} " if split_log_prefix else ""
+
+    for split_round in range(1, config.resplit_runs + 1):
+        print(f"\n{split_prefix}Split round {split_round}/{config.resplit_runs}")
+        enriched_train_dataset: PreparedTrainingDataset | None = None
+        train_loader: DataLoader | None = None
+        val_loader: DataLoader | None = None
+        try:
+            train_dataset, val_dataset, test_dataset = split_train_dataset(prepared_train_dataset)
+
+            # Apply enrichment to train_dataset if configured
+            if enrichment_jobs:
+                print(f"Applying enrichment with {len(enrichment_jobs)} jobs...")
+                enriched_train_dataset = run_enrichment_jobs(
+                    jobs=enrichment_jobs,
+                    subset=train_dataset,
+                    student_model=model,
+                    teacher_model=teacher_model,
+                    teacher_logits=prepared_train_dataset.teacher_logits,
+                )
+                train_dataset = enriched_train_dataset
+
+            train_loader, = make_data_loader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                pin_memory=(
+                    False
+                    if prepared_train_dataset.teacher_logits is not None
+                    and prepared_train_dataset.teacher_logits.device.type == "cuda"
+                    else None
+                ),
+            )
+            val_loader, = make_data_loader(
+                LabeledDatasetView(val_dataset),
+                batch_size=config.batch_size,
+                shuffle=False,
+            )
+            print(f"Train samples: {len(train_dataset)}")
+            print(f"Val samples: {len(val_dataset)}")
+            print(f"Test samples: {len(test_dataset)}")
+            split_learning_rate = get_learning_rate_for_split(config, split_round)
+            print(f"Learning rate for split {split_round}: {split_learning_rate}")
+
+            optimizer = optim.Adam(
+                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                lr=split_learning_rate,
+            )
+            model, round_history = train_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                config=config,
+                best_model_path=best_model_path,
+                split_round=split_round,
+                global_epoch_start=completed_epochs,
+                training_start_time=training_start_time,
+                epoch_end_handlers=epoch_end_handlers,
+            )
+            history.extend(round_history)
+            completed_epochs += sum(1 for entry in round_history if not entry.is_baseline)
+        finally:
+            # Explicitly drop large split-specific objects before the next round.
+            del train_loader
+            del val_loader
+            del enriched_train_dataset
+            if "train_dataset" in locals():
+                del train_dataset
+            if "val_dataset" in locals():
+                del val_dataset
+            if "test_dataset" in locals():
+                del test_dataset
+            gc.collect()
+            release_torch_memory()
+
+    return model, history

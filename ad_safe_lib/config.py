@@ -45,9 +45,6 @@ class TrainingConfig:
     learning_rate_multiplier: float = 1.0
     resplit_runs: int = DEFAULT_RESPLIT_RUNS
     unfreeze: tuple[str, ...] = ()
-    adversarial: bool = False
-    adv_epsilon: float = DEFAULT_ADV_EPSILON
-    adv_steps: int = DEFAULT_ADV_STEPS
     teacher_model_path: str | None = None
     distillation_alpha: float = DEFAULT_DISTILLATION_ALPHA
     distillation_temperature: float = DEFAULT_DISTILLATION_TEMPERATURE
@@ -143,7 +140,10 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def load_setup_values(setup_path: Path) -> dict[str, object]:
+def load_setup_values(setup_path: Path | None) -> dict[str, object]:
+    if setup_path is None:
+        return {}
+    
     try:
         setup_data = json.loads(setup_path.read_text())
     except json.JSONDecodeError as exc:
@@ -164,42 +164,18 @@ def load_setup_values(setup_path: Path) -> dict[str, object]:
     if not isinstance(cooldown_config, dict):
         raise ValueError("cooldown must be an object when present")
 
-    train_source = setup_data.get("train_source", {})
-    if train_source is None:
-        train_source = {}
-    if not isinstance(train_source, dict):
-        raise ValueError("train_source must be an object when present")
-
-    def get_optional_string(container: dict[str, object], field_name: str) -> str | None:
+    def get_optional_value(container: dict[str, object], field_name: str, expected_type: type) -> object:
         value = container.get(field_name)
         if value is None:
             return None
-        if not isinstance(value, str):
-            raise ValueError(f"{field_name} must be a string or null")
-        return value
-
-    def get_optional_int(container: dict[str, object], field_name: str) -> int | None:
-        value = container.get(field_name)
-        if value is None:
-            return None
-        if not isinstance(value, int):
-            raise ValueError(f"{field_name} must be an integer or null")
-        return value
-
-    def get_optional_float(container: dict[str, object], field_name: str) -> float | None:
-        value = container.get(field_name)
-        if value is None:
-            return None
-        if not isinstance(value, (int, float)):
-            raise ValueError(f"{field_name} must be a number or null")
-        return float(value)
-
-    def get_optional_bool(container: dict[str, object], field_name: str) -> bool | None:
-        value = container.get(field_name)
-        if value is None:
-            return None
-        if not isinstance(value, bool):
-            raise ValueError(f"{field_name} must be a boolean or null")
+        if isinstance(expected_type, tuple):
+            if not isinstance(value, expected_type):
+                raise ValueError(f"{field_name} must be one of {expected_type} or null")
+        else:
+            if not isinstance(value, expected_type):
+                raise ValueError(f"{field_name} must be {expected_type.__name__} or null")
+        if expected_type == float or (isinstance(expected_type, tuple) and float in expected_type):
+            return float(value)
         return value
 
     learning_rate_value = training_config.get("learning_rate")
@@ -210,34 +186,30 @@ def load_setup_values(setup_path: Path) -> dict[str, object]:
     if unfreeze_value is not None:
         unfreeze_value = normalize_unfreeze_value(unfreeze_value)
 
-    train_fraction = setup_data.get("train_fraction", train_source.get("fraction"))
+    train_fraction = setup_data.get("train_fraction")
 
     return {
-        "seed": get_optional_int(setup_data, "seed"),
-        "train_split": get_optional_string(setup_data, "train_split"),
-        "eval_split": get_optional_string(setup_data, "eval_split"),
+        "seed": get_optional_value(setup_data, "seed", int),
+        "train_split": get_optional_value(setup_data, "train_split", str),
+        "eval_split": get_optional_value(setup_data, "eval_split", str),
         "train_fraction": None if train_fraction is None else float(train_fraction),
-        "base_model": get_optional_string(setup_data, "base_model"),
-        "model_path": get_optional_string(setup_data, "original_model_path")
-        or get_optional_string(setup_data, "model_path"),
-        "epochs": get_optional_int(training_config, "epochs"),
-        "patience": get_optional_int(training_config, "patience"),
-        "batch_size": get_optional_int(training_config, "batch_size"),
+        "base_model": get_optional_value(setup_data, "base_model", str),
+        "model_path": get_optional_value(setup_data, "original_model_path", str),
+        "epochs": get_optional_value(training_config, "epochs", int),
+        "patience": get_optional_value(training_config, "patience", int),
+        "batch_size": get_optional_value(training_config, "batch_size", int),
         "learning_rate": learning_rate_value,
-        "learning_rate_multiplier": get_optional_float(training_config, "learning_rate_multiplier"),
-        "resplit_runs": get_optional_int(training_config, "resplit_runs"),
+        "learning_rate_multiplier": get_optional_value(training_config, "learning_rate_multiplier", (int, float)),
+        "resplit_runs": get_optional_value(training_config, "resplit_runs", int),
         "unfreeze": unfreeze_value,
-        "adversarial": get_optional_bool(training_config, "adversarial"),
-        "adv_epsilon": get_optional_float(training_config, "adv_epsilon"),
-        "adv_steps": get_optional_int(training_config, "adv_steps"),
-        "teacher_model_path": get_optional_string(training_config, "teacher_model_path"),
-        "distillation_alpha": get_optional_float(training_config, "distillation_alpha"),
-        "distillation_temperature": get_optional_float(training_config, "distillation_temperature"),
-        "cooldown_every_epochs": get_optional_int(cooldown_config, "every_epochs"),
-        "cooldown_seconds": get_optional_float(cooldown_config, "seconds"),
-        "gpu_max_temp": get_optional_int(cooldown_config, "gpu_max_temp"),
-        "gpu_resume_temp": get_optional_int(cooldown_config, "gpu_resume_temp"),
-        "gpu_temp_check_seconds": get_optional_float(cooldown_config, "gpu_temp_check_seconds"),
+        "teacher_model_path": get_optional_value(training_config, "teacher_model_path", str),
+        "distillation_alpha": get_optional_value(training_config, "distillation_alpha", (int, float)),
+        "distillation_temperature": get_optional_value(training_config, "distillation_temperature", (int, float)),
+        "cooldown_every_epochs": get_optional_value(cooldown_config, "every_epochs", int),
+        "cooldown_seconds": get_optional_value(cooldown_config, "seconds", (int, float)),
+        "gpu_max_temp": get_optional_value(cooldown_config, "gpu_max_temp", int),
+        "gpu_resume_temp": get_optional_value(cooldown_config, "gpu_resume_temp", int),
+        "gpu_temp_check_seconds": get_optional_value(cooldown_config, "gpu_temp_check_seconds", (int, float)),
     }
 
 
@@ -261,9 +233,6 @@ def merge_setup_and_cli_values(cli_values: Mapping[str, object], setup_values: d
         "unfreeze_all": pick_value("unfreeze_all", False),
         "unfreeze_top": pick_value("unfreeze_top", 0),
         "unfreeze": pick_value("unfreeze", ()),
-        "adversarial": pick_value("adversarial", False),
-        "adv_epsilon": pick_value("adv_epsilon", DEFAULT_ADV_EPSILON),
-        "adv_steps": pick_value("adv_steps", DEFAULT_ADV_STEPS),
         "teacher_model_path": pick_value("teacher_model_path", None),
         "distillation_alpha": pick_value("distillation_alpha", DEFAULT_DISTILLATION_ALPHA),
         "distillation_temperature": pick_value("distillation_temperature", DEFAULT_DISTILLATION_TEMPERATURE),
@@ -287,8 +256,8 @@ def resolve_effective_seed(seed_value: object) -> int:
         return make_seed()
     if not isinstance(seed_value, int):
         raise ValueError("seed must be an integer or null")
-    if seed_value == 0:
-        return make_seed()
+    if seed_value <= 0:
+        raise ValueError("seed must be a positive integer or null")
     return seed_value
 
 
@@ -299,8 +268,6 @@ def build_training_config(values: dict[str, object]) -> TrainingConfig:
     learning_rate_multiplier = float(values["learning_rate_multiplier"])
     explicit_unfreeze = normalize_unfreeze_value(values["unfreeze"])
     epochs = int(values["epochs"])
-    adv_steps = int(values["adv_steps"])
-    adv_epsilon = float(values["adv_epsilon"])
     teacher_model_path = values["teacher_model_path"]
     distillation_alpha = float(values["distillation_alpha"])
     distillation_temperature = float(values["distillation_temperature"])
@@ -313,10 +280,6 @@ def build_training_config(values: dict[str, object]) -> TrainingConfig:
         raise ValueError("--batch-size must be positive")
     if epochs <= 0:
         raise ValueError("--epochs must be positive")
-    if adv_steps < 0:
-        raise ValueError("--adv-steps must be non-negative")
-    if adv_epsilon < 0:
-        raise ValueError("--adv-epsilon must be non-negative")
     if teacher_model_path is not None and not isinstance(teacher_model_path, str):
         raise ValueError("--teacher-model-path must be a string or null")
     if distillation_alpha < 0 or distillation_alpha > 1:
@@ -346,9 +309,6 @@ def build_training_config(values: dict[str, object]) -> TrainingConfig:
         learning_rate_multiplier=learning_rate_multiplier,
         resplit_runs=resplit_runs,
         unfreeze=explicit_unfreeze,
-        adversarial=bool(values["adversarial"]),
-        adv_epsilon=adv_epsilon,
-        adv_steps=adv_steps,
         teacher_model_path=teacher_model_path,
         distillation_alpha=distillation_alpha,
         distillation_temperature=distillation_temperature,
@@ -364,9 +324,6 @@ def config_to_json_dict(config: TrainingConfig) -> dict[str, object]:
         "learning_rate_multiplier": config.learning_rate_multiplier,
         "resplit_runs": config.resplit_runs,
         "unfreeze": list(config.unfreeze),
-        "adversarial": config.adversarial,
-        "adv_epsilon": config.adv_epsilon,
-        "adv_steps": config.adv_steps,
         "teacher_model_path": config.teacher_model_path,
         "distillation_alpha": config.distillation_alpha,
         "distillation_temperature": config.distillation_temperature,

@@ -23,6 +23,7 @@ from .config import DATA_DIR, DEVICE, TrainingConfig, config_to_json_dict, resol
 from .contract import run_foreign_contract_check
 from .cooldown import CooldownConfig, CooldownEpochEndHandler, EpochEndHandler
 from .data import DatasetSourceSpec, load_dataset_source, make_data_loader
+from .enrichment import EnrichmentJobSpec
 from .evaluation_runner import evaluate_model_checkpoint
 from .figures import generate_training_history_figure, save_figure
 from .metrics import ClassificationMetrics
@@ -46,14 +47,14 @@ class PhaseSpec:
     requested_seed: int | None = None
     unfreeze_all: bool = False
     unfreeze_top: int = 0
-    name: str | None = None
+    title: str | None = None
     signature: dict[str, Any] = field(default_factory=dict)
     model_filename: str | None = None
     history_filename: str | None = None
     json_filename: str | None = None
 
-    def display_name(self) -> str:
-        return self.name or self.prefix
+    def display_title(self) -> str:
+        return self.title or self.prefix
 
 
 @dataclass(frozen=True)
@@ -62,12 +63,13 @@ class JobSpec:
     job_id: str
     backbone: str
     phases: tuple[PhaseSpec, ...]
-    display_name: str | None = None
+    title: str | None = None
     initial_model_path: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    enrichment_jobs: tuple[EnrichmentJobSpec, ...] = ()
 
-    def display_row_id(self) -> str:
-        return self.display_name or self.job_id
+    def display_title(self) -> str:
+        return self.title or self.job_id
 
 
 @dataclass(frozen=True)
@@ -97,7 +99,7 @@ class TrainingPhaseResult:
     job_index: int
     phase_index: int
     prefix: str
-    phase_name: str
+    phase_title: str
     config: TrainingConfig
     model_path: Path
     json_path: Path
@@ -158,7 +160,7 @@ def build_phase_signature(
         "backbone": job.backbone,
         "phase_index": phase.phase_index,
         "phase_prefix": phase.prefix,
-        "phase_name": phase.display_name(),
+        "phase_title": phase.display_title(),
         "requested_seed": phase.requested_seed,
         "unfreeze_all": phase.unfreeze_all,
         "unfreeze_top": phase.unfreeze_top,
@@ -233,7 +235,7 @@ def build_training_phase_payload(
         "job_index": job.job_index,
         "phase_index": phase.phase_index,
         "phase_prefix": phase.prefix,
-        "phase_name": phase.display_name(),
+        "phase_title": phase.display_title(),
         "output_model_path": path_to_json(model_path),
         "accuracy": {
             split_name: metrics.accuracy
@@ -280,7 +282,7 @@ def read_training_metrics_csv_rows(
 
 
 def training_metrics_metadata_fields() -> tuple[str, ...]:
-    return ("prefix", "job_index", "phase_index", "job_id", "phase_name", "model_path")
+    return ("row_id", "job_id", "phase_title", "model_path")
 
 
 def update_training_metrics_csv(
@@ -292,16 +294,14 @@ def update_training_metrics_csv(
     existing_rows = [
         row
         for row in read_training_metrics_csv_rows(path, eval_splits)
-        if row.metadata.get("prefix") != result.prefix
+        if row.metadata.get("row_id") != result.prefix
     ]
     existing_rows.append(
         MetricsCsvRow(
             metadata={
-                "prefix": result.prefix,
-                "job_index": result.job_index,
-                "phase_index": result.phase_index,
+                "row_id": result.prefix,
                 "job_id": result.job_id,
-                "phase_name": result.phase_name,
+                "phase_title": result.phase_title,
                 "model_path": path_to_json(result.model_path),
             },
             metrics_by_dataset=result.metrics_by_split,
@@ -324,9 +324,8 @@ def training_results_to_matrix_rows(
             row_id=result.prefix,
             metrics_by_dataset=result.metrics_by_split,
             metadata={
-                "prefix": result.prefix,
                 "job_id": result.job_id,
-                "phase_name": result.phase_name,
+                "phase_title": result.phase_title,
                 "model_path": path_to_json(result.model_path),
             },
         )
@@ -340,7 +339,7 @@ def metrics_matrix_rows_from_training_csv(
 ) -> list[MetricsMatrixRow]:
     return [
         MetricsMatrixRow(
-            row_id=str(row.metadata.get("prefix", "")),
+            row_id=str(row.metadata.get("row_id", "")),
             metrics_by_dataset=row.metrics_by_dataset,
             metadata=row.metadata,
         )
@@ -381,7 +380,7 @@ def write_training_run_setup(
             {
                 "job_id": job.job_id,
                 "job_index": job.job_index,
-                "display_name": job.display_name,
+                "title": job.title,
                 "backbone": job.backbone,
                 "initial_model_path": path_to_json(job.initial_model_path),
                 "metadata": job.metadata,
@@ -389,7 +388,7 @@ def write_training_run_setup(
                     {
                         "phase_index": phase.phase_index,
                         "prefix": phase.prefix,
-                        "name": phase.display_name(),
+                        "title": phase.title,
                         "requested_seed": phase.requested_seed,
                         "unfreeze_all": phase.unfreeze_all,
                         "unfreeze_top": phase.unfreeze_top,
@@ -407,7 +406,7 @@ def write_training_run_setup(
                 "job_index": result.job_index,
                 "phase_index": result.phase_index,
                 "prefix": result.prefix,
-                "phase_name": result.phase_name,
+                "phase_title": result.phase_title,
                 "model_path": path_to_json(result.model_path),
                 "history_path": path_to_json(result.history_path),
                 "json_path": path_to_json(result.json_path),
@@ -505,6 +504,8 @@ def run_training_phase(
     history_path = phase_history_path(plan, phase)
 
     print(f"\n=== Phase {phase.prefix} ===")
+    if phase.title:
+        print(f"Phase title: {phase.title}")
     seed = resolve_effective_seed(phase.requested_seed)
     set_seed(seed)
     model = load_model(previous_model_path) if previous_model_path is not None else make_model(job.backbone)
@@ -533,7 +534,7 @@ def run_training_phase(
             job_index=job.job_index,
             phase_index=phase.phase_index,
             prefix=phase.prefix,
-            phase_name=phase.display_name(),
+            phase_title=phase.display_title(),
             config=config,
             model_path=model_path,
             json_path=json_path,
@@ -576,7 +577,7 @@ def run_training_phase(
                 CooldownEpochEndHandler(
                     config=plan.cooldown,
                     backbone_name=job.backbone,
-                    phase_name=phase.display_name(),
+                    phase_title=phase.display_title(),
                 ),
             )
         model, history = train_model_across_resplits(
@@ -584,8 +585,10 @@ def run_training_phase(
             full_train_dataset=full_train_dataset,
             config=config,
             best_model_path=model_path,
-            split_log_prefix=f"{job.display_row_id()} {phase.display_name()}",
+            split_log_prefix=f"{job.display_title()} {phase.display_title()}",
             epoch_end_handlers=epoch_end_handlers,
+            enrichment_jobs=job.enrichment_jobs,
+            teacher_model=None,
         )
         save_model(model, model_path)
         save_figure(
@@ -628,7 +631,7 @@ def run_training_phase(
             job_index=job.job_index,
             phase_index=phase.phase_index,
             prefix=phase.prefix,
-            phase_name=phase.display_name(),
+                phase_title=phase.display_title(),
             config=config,
             model_path=model_path,
             json_path=json_path,
@@ -714,6 +717,9 @@ def run_training_plan(plan: RunPlan) -> TrainingRunResult:
     write_training_run_setup(plan=execution_plan, results=phase_results)
 
     for job in execution_plan.jobs:
+        print(f"\n=== Job {job.job_id} ===")
+        if job.title:
+            print(f"Job title: {job.title}")
         previous_model_path = job.initial_model_path
         for phase in job.phases:
             result = run_training_phase(

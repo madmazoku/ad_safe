@@ -16,14 +16,16 @@ Execution:
 result = ad_safe.run_training_plan(plan)
 ```
 
-Teacher distillation is controlled by `teacher_model_path`, `distillation_alpha`, and `distillation_temperature`. Adversarial mode mutates the training dataset by appending generated adversarial samples before normal train/validation resplits.
+Teacher distillation is controlled by `teacher_model_path`, `distillation_alpha`, and `distillation_temperature`. 
+
+Data augmentation uses enrichment jobs specified separately in the `JobSpec`. Enrichment jobs can apply multiple strategies (e.g., adversarial perturbation, geometric transforms) to generate synthetic training samples. The enrichment pipeline is decoupled from the core training config.
 
 `generate_adversarial_perturbation(...)` accepts an attack strategy object:
 
 - `BudgetedPgdStrategy(epsilon=..., num_steps=...)`: use the requested epsilon budget directly. This is the training default.
 - `MinimalFlipPgdStrategy(max_epsilon=..., num_steps=...)`: search up to the requested epsilon and return the smallest found perturbation that flips the true class. This is intended for figures and analysis.
 
-Pass `return_result=True` for a single-sample attack when you also need epsilon, confidence, and distance metrics.
+`generate_adversarial_perturbation(...)` always returns `AdversarialPerturbationResult`.
 
 Class reversal uses a separate strategy family because it is not an adversarial
 perturbation from a real sample. It optimizes a synthetic image toward a target

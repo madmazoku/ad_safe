@@ -172,9 +172,6 @@ def generate_training_history_figure(
             ("learning_rate", ",".join(str(value) for value in config.learning_rate)),
             ("learning_rate_multiplier", str(config.learning_rate_multiplier)),
             ("unfreeze", ",".join(config.unfreeze) if config.unfreeze else "<head only>"),
-            ("adversarial", str(config.adversarial)),
-            ("adv_epsilon", str(config.adv_epsilon)),
-            ("adv_steps", str(config.adv_steps)),
             (
                 "teacher_model",
                 Path(config.teacher_model_path).name if config.teacher_model_path is not None else "<none>",
@@ -287,7 +284,6 @@ def generate_adversarial_example(
             criterion=criterion,
             target_labels=torch.tensor([target_label_idx], device=DEVICE),
             strategy=attack_strategy,
-            return_result=True,
         )
         attempt = {
             "sample_index": sample_index,
@@ -330,7 +326,6 @@ def generate_adversarial_example(
             criterion=criterion,
             target_labels=torch.tensor([target_label_idx], device=DEVICE),
             strategy=attack_strategy,
-            return_result=True,
         )
         selected_attempt = {
             "sample_index": sample_index,

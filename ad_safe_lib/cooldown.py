@@ -55,11 +55,11 @@ class CooldownEpochEndHandler(EpochEndHandler):
         *,
         config: CooldownConfig,
         backbone_name: str,
-        phase_name: str,
+        phase_title: str,
     ) -> None:
         self.config = config
         self.backbone_name = backbone_name
-        self.phase_name = phase_name
+        self.phase_title = phase_title
         self._nvml = None
         self._handle = None
         if self.config.uses_temperature:
@@ -91,7 +91,7 @@ class CooldownEpochEndHandler(EpochEndHandler):
         started = time.time()
         deadline = started + self.config.seconds
         print(
-            f"Cooldown start | {self.backbone_name} {self.phase_name} | "
+            f"Cooldown start | {self.backbone_name} {self.phase_title} | "
             f"reason={','.join(reasons)} | max_wait={self.config.seconds:.1f}s"
         )
 

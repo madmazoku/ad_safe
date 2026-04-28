@@ -89,8 +89,13 @@ class PreparedTrainingDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[Tensor, int] | tuple[Tensor, int, Tensor]:
         if index < self.base_sample_count:
-            image, label = self.dataset[index]
-            teacher_logits = self.teacher_logits[index] if self.teacher_logits is not None else None
+            base_item = self.dataset[index]
+            image, label = base_item[0], int(base_item[1])
+            teacher_logits: Tensor | None = None
+            if self.teacher_logits is not None:
+                teacher_logits = self.teacher_logits[index]
+            elif len(base_item) >= 3:
+                teacher_logits = base_item[2]
         else:
             image, label, teacher_logits = self.extra_samples[index - self.base_sample_count]
 
@@ -99,11 +104,18 @@ class PreparedTrainingDataset(Dataset):
         return image, label, teacher_logits
 
     def get_teacher_logits(self, index: int) -> Tensor | None:
-        if self.teacher_logits is None:
-            return None
         if index >= self.base_sample_count:
             return self.extra_samples[index - self.base_sample_count][2]
-        return self.teacher_logits[index]
+        if self.teacher_logits is not None:
+            return self.teacher_logits[index]
+
+        if hasattr(self.dataset, "get_teacher_logits"):
+            return self.dataset.get_teacher_logits(index)
+
+        base_item = self.dataset[index]
+        if len(base_item) >= 3:
+            return base_item[2]
+        return None
 
     def add_sample(
         self,

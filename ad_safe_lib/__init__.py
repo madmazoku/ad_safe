@@ -84,6 +84,22 @@ from .data import (
     split_train_dataset,
     to_device,
 )
+from .enrichment import (
+    AdversarialStrategy,
+    EnrichmentStrategy,
+    EnrichmentJobSpec,
+    EnrichmentPhaseSpec,
+    GaussianBlurStrategy,
+    GrayscaleStrategy,
+    HorizontalFlipStrategy,
+    PerspectiveStrategy,
+    RotateStrategy,
+    ScaleStrategy,
+    StrictInheritanceStrategy,
+    VerticalFlipStrategy,
+    run_enrichment_job,
+    run_enrichment_jobs,
+)
 from .evaluation_runner import (
     DatasetEvalSpec,
     EvaluationPlan,
@@ -161,7 +177,6 @@ from .training import (
     MinimalFlipPgdStrategy,
     compute_distillation_loss,
     compute_supervised_training_loss,
-    extend_dataset_with_adversarial_samples,
     generate_adversarial_perturbation,
     precompute_teacher_logits,
     prepare_training_dataset,

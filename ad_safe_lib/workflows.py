@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .artifacts import load_model, release_torch_memory
 from .backbones import configure_trainable_layers, describe_model, finalize_training_config
-from .config import TrainingConfig
+from .config import DEFAULT_ADV_EPSILON, DEFAULT_ADV_STEPS, TrainingConfig
 from .data import load_dataset
 from .figures import (
     generate_adversarial_example,
@@ -70,8 +70,8 @@ def generate_single_model_artifacts(
         generate_adversarial_example(
             model=model,
             sample_dataset=eval_dataset,
-            epsilon=finalized_config.adv_epsilon,
-            num_steps=max(finalized_config.adv_steps, 1),
+            epsilon=DEFAULT_ADV_EPSILON,
+            num_steps=max(DEFAULT_ADV_STEPS, 1),
         ),
         output_dir / f"{output_prefix}_adversarial.png",
     )

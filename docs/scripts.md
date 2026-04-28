@@ -96,6 +96,12 @@ The sweep config path is resolved in this order when you pass a relative path:
 
 Sweep outputs are written to `<output_root>/<run_id>/` with per-phase checkpoints and JSON files plus `accuracy.csv` and `setup.json`.
 
+Resume an interrupted sweep:
+
+```bash
+../venv/bin/python train_prod_ad_safe_sweep.py simple_cnn_sweep.json --run-id 2026-04-23-20-46-17
+```
+
 Teacher distillation phase example:
 
 ```json
@@ -106,15 +112,35 @@ Teacher distillation phase example:
 }
 ```
 
-Adversarial augmentation phase example:
+Enrichment job example with adversarial augmentation phase:
 
 ```json
 {
-  "adversarial": true,
-  "adv_epsilon": 0.03,
-  "adv_steps": 1
+  "enrichment_jobs": [
+    {
+      "phases": [
+        {
+          "strategy": "adversarial",
+          "params": {
+            "epsilon": 0.03,
+            "steps": 1
+          }
+        }
+      ]
+    }
+  ]
 }
 ```
+
+Other supported enrichment strategies:
+
+- `horizontal_flip`, `vertical_flip` — mirror transformations (no params)
+- `rotate` — rotation by specified angles. Params: `angles` (array of degrees, e.g. `[90, 180, 270]`)
+- `scale` — resize by factor. Params: `factor_min`, `factor_max` (floats, e.g. `0.9`, `1.1`)
+- `gaussian_blur` — blur augmentation. Params: `kernel_size`, `sigma_min`, `sigma_max`
+- `perspective` — perspective distortion. Params: `distortion_scale` (float, e.g. `0.2`)
+- `grayscale` — convert to grayscale (no params)
+- `adversarial` — adversarial perturbation. Params: `epsilon`, `steps`
 
 ## Backbone Comparison
 
