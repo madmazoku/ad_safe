@@ -36,6 +36,7 @@ from .reporting import (
     write_metrics_csv_rows,
 )
 from .training import train_model_across_resplits
+from .training import build_teacher_logits_cache_key
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,8 @@ class PhaseSpec:
     unfreeze_top: int = 0
     title: str | None = None
     signature: dict[str, Any] = field(default_factory=dict)
+    enrichment_jobs: tuple[EnrichmentJobSpec, ...] = ()
+    enrichment_jobs_payload: tuple[dict[str, Any], ...] = ()
     model_filename: str | None = None
     history_filename: str | None = None
     json_filename: str | None = None
@@ -91,6 +94,7 @@ class RunPlan:
     train_dataset: Dataset | None = None
     eval_datasets: dict[str, Dataset] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    teacher_logits_cache: dict[tuple[Any, ...], Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +147,7 @@ def build_phase_signature(
     job: JobSpec,
     phase: PhaseSpec,
     config: TrainingConfig,
+    seed: int,
 ) -> dict[str, Any]:
     return {
         "run_id": plan.run_id,
@@ -161,10 +166,12 @@ def build_phase_signature(
         "phase_index": phase.phase_index,
         "phase_prefix": phase.prefix,
         "phase_title": phase.display_title(),
+        "effective_seed": seed,
         "requested_seed": phase.requested_seed,
         "unfreeze_all": phase.unfreeze_all,
         "unfreeze_top": phase.unfreeze_top,
         "training_config": config_to_json_dict(config),
+        "enrichment_jobs": list(phase.enrichment_jobs_payload),
         "extra": json_ready(phase.signature),
     }
 
@@ -230,6 +237,7 @@ def build_training_phase_payload(
         "training_checkpoint_path": path_to_json(model_path),
         "training_history_figure_path": path_to_json(history_path),
         "training_config": config_to_json_dict(config),
+        "enrichment_jobs": list(phase.enrichment_jobs_payload),
         "status": status,
         "job_id": job.job_id,
         "job_index": job.job_index,
@@ -258,6 +266,7 @@ def build_training_phase_payload(
             job=job,
             phase=phase,
             config=config,
+            seed=seed,
         ),
     }
 
@@ -312,7 +321,7 @@ def update_training_metrics_csv(
         rows=existing_rows,
         dataset_names=eval_splits,
         metadata_fields=training_metrics_metadata_fields(),
-        sort_metadata_field="prefix",
+        sort_metadata_field="row_id",
     )
 
 
@@ -393,6 +402,7 @@ def write_training_run_setup(
                         "unfreeze_all": phase.unfreeze_all,
                         "unfreeze_top": phase.unfreeze_top,
                         "training_config": config_to_json_dict(phase.config),
+                        "enrichment_jobs": list(phase.enrichment_jobs_payload),
                         "signature": phase.signature,
                     }
                     for phase in job.phases
@@ -520,6 +530,7 @@ def run_training_phase(
         job=job,
         phase=phase,
         config=config,
+        seed=seed,
     )
 
     skipped, skipped_metrics = should_skip_training_phase(
@@ -587,8 +598,15 @@ def run_training_phase(
             best_model_path=model_path,
             split_log_prefix=f"{job.display_title()} {phase.display_title()}",
             epoch_end_handlers=epoch_end_handlers,
-            enrichment_jobs=job.enrichment_jobs,
+            enrichment_jobs=phase.enrichment_jobs,
             teacher_model=None,
+            replay_seed=seed,
+            teacher_logits_cache=plan.teacher_logits_cache,
+            teacher_logits_cache_key=build_teacher_logits_cache_key(
+                teacher_model_path=config.teacher_model_path,
+                train_source=plan.train_source,
+                dataset=full_train_dataset,
+            ),
         )
         save_model(model, model_path)
         save_figure(
@@ -711,6 +729,7 @@ def run_training_plan(plan: RunPlan) -> TrainingRunResult:
                 if split_name not in plan.eval_datasets
             },
         },
+        teacher_logits_cache={},
     )
     metrics_csv_path = plan.metrics_csv_path or (plan.output_dir / "accuracy.csv")
     phase_results: list[TrainingPhaseResult] = []

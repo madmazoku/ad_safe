@@ -1,6 +1,6 @@
 # Ad Safety Example Notebooks
 
-These notebooks are intentionally tiny. They demonstrate the library APIs and artifact layout, not final model quality.
+These notebooks are intentionally tiny. They demonstrate the library APIs and runtime path constants, not final model quality.
 
 - `01_from_scratch_quick_train.ipynb`: scratch `simple_cnn` train, evaluation, figures.
 - `02_staged_pretrained_adversarial.ipynb`: lightweight pretrained staged training with adversarial augmentation.

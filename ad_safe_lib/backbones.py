@@ -39,13 +39,11 @@ from .backbone_registry import SUPPORTED_BACKBONES, finalize_built_model, list_s
 from .backbone_wrappers import (
     CLIP_MEAN,
     CLIP_STD,
-    DEFAULT_MODEL_WEIGHTS,
     HF_CLIP_VIT_L_14_MODEL_ID,
     HF_DINOV2_IMAGE_CLASSIFICATION_MODEL_ID,
     HF_DINOV3_VITL16_PRETRAIN_MODEL_ID,
     IMAGENET_MEAN,
     IMAGENET_STD,
-    MODEL_PREPROCESS,
     NORMALIZE_TRANSFORM,
     build_dinov3_features_graph,
     build_hf_logits_graph,

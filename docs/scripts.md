@@ -38,13 +38,7 @@ Use the latest single-run checkpoint:
   --batch-size 16
 ```
 
-Single-run outputs are written under `artefacts/ad_safe_runs/` with a timestamp prefix:
-
-- `<run_id>-model.pt`
-- `<run_id>-training_history.png`
-- `<run_id>-phase.json`
-- `<run_id>-accuracy.csv`
-- `<run_id>-setup.json`
+Single-run outputs are written under `artefacts/ad_safe_runs/` with a timestamp prefix.
 
 ## Sweep
 
@@ -94,13 +88,67 @@ The sweep config path is resolved in this order when you pass a relative path:
 3. `artefacts/`
 4. `challenge/`
 
-Sweep outputs are written to `<output_root>/<run_id>/` with per-phase checkpoints and JSON files plus `accuracy.csv` and `setup.json`.
+Sweep outputs are written to `artefacts/prod_models/<run_id>_<sweep-title>/` by default. That directory contains every phase checkpoint, phase JSON, history figure, `setup.json`, and the shared `accuracy.csv` for comparing all jobs in the sweep.
 
 Resume an interrupted sweep:
 
 ```bash
 ../venv/bin/python train_prod_ad_safe_sweep.py simple_cnn_sweep.json --run-id 2026-04-23-20-46-17
 ```
+
+### Sweep Config Format
+
+`train_prod_ad_safe_sweep.py` expects a JSON object. Only documented top-level fields affect execution. Unknown phase fields are rejected in `defaults`, `jobs[]`, and `jobs[].phases[]`.
+
+Top-level fields:
+
+- `backbone` (required string): one of the names exposed by `ad_safe_lib.SUPPORTED_BACKBONES`.
+- `title` or `sweep_title` (optional string): readable sweep name used in the output folder. If omitted, the config filename is used.
+- `output_root` (optional string): parent output directory. Relative paths are resolved from the config file directory. Defaults to `artefacts/prod_models`.
+- `run_id` (optional string or null): output run directory name. `null` or omission creates a timestamp. Path separators are not allowed.
+- `train_split` (optional string): dataset split used for training. Defaults to `train`.
+- `train_fraction` (optional number): stratified fraction of `train_split`, in `(0, 1]`. Defaults to `1.0`.
+- `eval_splits` (optional string or string array): evaluation split names. Omission discovers available dataset splits.
+- `resume` (optional boolean): reuse completed matching phase artifacts. Defaults to `true`.
+- `force` (optional boolean): rerun phases even when resume artifacts exist. Defaults to `false`.
+- `cooldown` (optional object): cooldown settings.
+- `defaults` (optional object): default phase fields.
+- `jobs` (required non-empty array): sweep jobs.
+
+`cooldown` fields:
+
+- `every_epochs` (integer >= 0): run cooldown after every N global epochs. `0` disables periodic cooldown.
+- `seconds` (number >= 0): maximum cooldown duration.
+- `gpu_max_temp` (integer >= 0): start cooldown when GPU temperature reaches this Celsius value. `0` disables temperature cooldown.
+- `gpu_resume_temp` (integer >= 0): resume at or below this Celsius value. If `gpu_max_temp > 0` and this is `0`, it becomes `gpu_max_temp - 5`.
+- `gpu_temp_check_seconds` (number > 0): polling interval while cooling down.
+
+Phase fields accepted in `defaults`, `jobs[]`, and `jobs[].phases[]`:
+
+- `epochs` (positive integer)
+- `resplit_runs` (positive integer)
+- `batch_size` (positive integer)
+- `learning_rate` (positive number, numeric string, or non-empty array of positive numbers)
+- `learning_rate_multiplier` (positive number). Cannot be used with multiple `learning_rate` values.
+- `patience` (integer >= 0)
+- `seed` (non-negative integer or null): `0` or `null` generates a fresh random seed.
+- `unfreeze_all` (boolean): train all layers instead of only the head.
+- `teacher_model_path` (string or null): teacher checkpoint. Relative/bare values are searched from the config directory, `artefacts/ad_safe_runs/`, `artefacts/`, then the challenge root.
+- `distillation_alpha` (number in `[0, 1]`)
+- `distillation_temperature` (positive number)
+
+Job objects also accept:
+
+- `title` (optional string)
+- `phases` (required non-empty array)
+- `enrichment_jobs` (optional array)
+
+Phase objects also accept:
+
+- `title` (optional string)
+- `enrichment_jobs` (optional array)
+
+Field inheritance is `defaults` -> `jobs[]` -> `jobs[].phases[]`, with nearer values overriding earlier values. `enrichment_jobs` follows the same nearest-scope rule: phase-level enrichment replaces job/default enrichment, and job-level enrichment replaces default enrichment.
 
 Teacher distillation phase example:
 
@@ -118,6 +166,7 @@ Enrichment job example with adversarial augmentation phase:
 {
   "enrichment_jobs": [
     {
+      "input_replay_fraction": 0.25,
       "phases": [
         {
           "strategy": "adversarial",
@@ -131,6 +180,12 @@ Enrichment job example with adversarial augmentation phase:
   ]
 }
 ```
+
+`input_replay_fraction` controls how much of a phase input dataset is replayed into the enrichment output:
+
+- `1.0` keeps all input samples plus derived samples
+- `0.0` keeps only derived samples
+- any intermediate float keeps a deterministic random fraction of the input samples
 
 Other supported enrichment strategies:
 

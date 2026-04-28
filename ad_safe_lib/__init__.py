@@ -86,6 +86,8 @@ from .data import (
 )
 from .enrichment import (
     AdversarialStrategy,
+    BrightnessStrategy,
+    ContrastStrategy,
     EnrichmentStrategy,
     EnrichmentJobSpec,
     EnrichmentPhaseSpec,
@@ -93,8 +95,11 @@ from .enrichment import (
     GrayscaleStrategy,
     HorizontalFlipStrategy,
     PerspectiveStrategy,
+    RandomErasingStrategy,
     RotateStrategy,
+    SaturationStrategy,
     ScaleStrategy,
+    SharpnessStrategy,
     StrictInheritanceStrategy,
     VerticalFlipStrategy,
     run_enrichment_job,

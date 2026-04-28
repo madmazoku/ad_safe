@@ -197,9 +197,7 @@ def build_evaluation_plan(args: argparse.Namespace) -> ad_safe.EvaluationPlan:
 
 
 def main() -> None:
-    result = ad_safe.run_evaluation_plan(build_evaluation_plan(parse_args()))
-    if result.csv_path is not None:
-        print(f"\nMetrics CSV saved to {result.csv_path}")
+    ad_safe.run_evaluation_plan(build_evaluation_plan(parse_args()))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ This folder contains the ad-safety training and evaluation code for the ML bootc
 - `check_ad_safe_contract.py`: standalone foreign-code contract check; it intentionally does not import `ad_safe_lib`.
 - `notebooks/ad_safe_examples/`: lightweight example notebooks.
 - `docs/`: architecture, script, and library notes.
-- `datasets/`, `artefacts/`: local runtime inputs/outputs. Their contents are ignored by git.
+- `datasets/`: local dataset storage.
+- `artefacts/`: local runtime storage for script inputs and outputs. Its contents are ignored by git.
 
 ## Quick Start
 
@@ -48,7 +49,7 @@ Expected dataset root:
 datasets/ml_bootcamp_adsafety_dataset/{train,val,test}/{safe,unsafe}/...
 ```
 
-Generated checkpoints, figures, CSVs, sweep configs, and datasets are local files. The repository tracks only placeholder directories.
+Datasets and artefacts are local runtime files. The repository tracks only placeholder directories.
 
 ## More Docs
 

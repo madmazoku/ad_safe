@@ -65,16 +65,18 @@ def make_data_loader(
 
 
 class PreparedTrainingDataset(Dataset):
-    def __init__(self, dataset: Dataset):
+    def __init__(self, dataset: Dataset, *, base_indices: list[int] | None = None):
         self.dataset = dataset
         self.teacher_logits: Tensor | None = None
         self.extra_samples: list[tuple[Tensor, int, Tensor | None]] = []
+        self.base_indices = list(range(len(dataset))) if base_indices is None else list(base_indices)
         self.classes = get_dataset_classes(dataset)
-        self.targets = get_dataset_targets(dataset)
+        dataset_targets = get_dataset_targets(dataset)
+        self.targets = [int(dataset_targets[index]) for index in self.base_indices]
 
     @property
     def base_sample_count(self) -> int:
-        return len(self.dataset)
+        return len(self.base_indices)
 
     def set_teacher_logits(self, teacher_logits: Tensor | None) -> None:
         if teacher_logits is not None and teacher_logits.shape[0] != self.base_sample_count:
@@ -89,7 +91,7 @@ class PreparedTrainingDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[Tensor, int] | tuple[Tensor, int, Tensor]:
         if index < self.base_sample_count:
-            base_item = self.dataset[index]
+            base_item = self.dataset[self.base_indices[index]]
             image, label = base_item[0], int(base_item[1])
             teacher_logits: Tensor | None = None
             if self.teacher_logits is not None:
@@ -110,9 +112,9 @@ class PreparedTrainingDataset(Dataset):
             return self.teacher_logits[index]
 
         if hasattr(self.dataset, "get_teacher_logits"):
-            return self.dataset.get_teacher_logits(index)
+            return self.dataset.get_teacher_logits(self.base_indices[index])
 
-        base_item = self.dataset[index]
+        base_item = self.dataset[self.base_indices[index]]
         if len(base_item) >= 3:
             return base_item[2]
         return None

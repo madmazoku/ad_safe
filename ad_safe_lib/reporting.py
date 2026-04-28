@@ -66,7 +66,7 @@ def make_metrics_cell(
     *,
     metric_names: Sequence[str] = DEFAULT_PRINT_METRICS,
 ) -> str:
-    return " ".join(
+    return "\n".join(
         f"{metric_csv_name(metric_name)}={format_metric(metric_value(metrics, metric_name))}"
         for metric_name in metric_names
     )
@@ -94,7 +94,13 @@ def print_metrics_matrix(
         for row in rows
     ]
     widths = {
-        header: max(len(header), *(len(row[index]) for row in table_rows))
+        header: max(
+            len(header),
+            *(
+                max(len(line) for line in row[index].splitlines())
+                for row in table_rows
+            ),
+        )
         for index, header in enumerate(headers)
     }
 
@@ -102,7 +108,20 @@ def print_metrics_matrix(
     print("  ".join(header.ljust(widths[header]) for header in headers))
     print("  ".join("-" * widths[header] for header in headers))
     for row in table_rows:
-        print("  ".join(value.ljust(widths[headers[index]]) for index, value in enumerate(row)))
+        cell_lines = [value.splitlines() for value in row]
+        row_height = max(len(lines) for lines in cell_lines)
+        for line_index in range(row_height):
+            print(
+                "  ".join(
+                    (
+                        cell_lines[index][line_index]
+                        if line_index < len(cell_lines[index])
+                        else ""
+                    ).ljust(widths[headers[index]])
+                    for index in range(len(headers))
+                )
+            )
+        print()
 
 
 def flatten_metrics(

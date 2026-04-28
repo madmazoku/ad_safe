@@ -8,7 +8,7 @@ Key types and functions:
 - `make_stratified_subset(dataset, fraction, seed=...)`
 - `make_data_loader(...)`
 
-`load_dataset` always loads the full named split from `DATA_DIR`. `load_dataset_source` adds optional stratified subsetting before the dataset enters training or evaluation.
+`load_dataset` always loads the full named split from `DATA_DIR` and applies the shared resize/to-tensor transform to `IMAGE_SIZE` (`299`). `load_dataset_source` adds optional stratified subsetting before the dataset enters training or evaluation.
 
 Example:
 

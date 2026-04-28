@@ -10,13 +10,14 @@ This directory is the ad-safety project root. Keep changes aligned with the clea
 - Do not add model training loops, `DataLoader` construction, optimizer setup, metrics CSV writing, or terminal table formatting to scripts.
 - Do not add legacy compatibility code. When a module is moved or removed, update imports, docs, and notebooks in the same change.
 - Keep `check_ad_safe_contract.py` standalone. It simulates foreign code and must not import `ad_safe` or `ad_safe_lib`.
+- Enrichment dataset traversal belongs in `ad_safe_lib.enrichment` runners, not in strategies. Strategies should transform a provided sample or batch (`transform_sample` / `generate_batch`) and return derived samples with source positions; progress bars, `DataLoader` iteration, label/logit inheritance, and attaching samples stay in the runner.
 
 ## Paths
 
 - `ad_safe_lib.CHALLENGE_DIR` is the canonical project root.
 - Datasets live under `datasets/`.
-- Runtime outputs live under `artefacts/`.
-- Sweep JSON files live under `artefacts/sweep_configs/`.
+- Runtime script inputs and outputs live under `artefacts/`.
+- Sweep JSON files are resolved from the working directory, `artefacts/sweep_configs/`, `artefacts/`, or the challenge root.
 - The contents of `datasets/` and `artefacts/` are local runtime data and should stay ignored by git except `.gitkeep` placeholders.
 
 ## Notebooks
@@ -28,6 +29,10 @@ This directory is the ad-safety project root. Keep changes aligned with the clea
 - Do not search parent directories for `ad_safe.py`.
 
 ## Before Finishing
+
+When code behavior, CLI options, JSON formats, or public `ad_safe_lib` APIs change, update the markdown knowledge base in the same change. Keep those notes tied to code behavior, not to local generated artifact contents.
+
+When changing enrichment behavior, keep the architecture note in `docs/architecture.md` and the public API note in `docs/library/training.md` aligned with `ad_safe_lib/enrichment.py`.
 
 Run the static checks that match the change:
 

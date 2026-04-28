@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
+import gc
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import Subset
 from torchvision import transforms
+from tqdm.auto import tqdm
 
+from .artifacts import release_torch_memory
+from .config import DEVICE
 from .data import PreparedTrainingDataset, make_data_loader, to_device
 from .backbones import forward_logits
 
@@ -77,77 +81,64 @@ def generate_budgeted_pgd_perturbation(
 
 
 class EnrichmentStrategy(ABC):
-    """Base class for all enrichment strategies.
-    Defines the contract for generating derived samples from a dataset subset.
+    """Base class for enrichment strategies.
+
+    The runner owns dataset iteration and progress reporting. Strategies only
+    transform a provided batch and return derived images paired with source
+    positions inside the input subset.
     """
 
     @abstractmethod
-    def run(
+    def generate_batch(
         self,
-        subset: Subset,
+        *,
+        images: Tensor,
+        labels: Tensor,
+        source_positions: Tensor,
         student_model: nn.Module | None,
         teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        """Generate derived sample images from the input subset.
-        
-        Args:
-            subset: Dataset subset to generate samples from.
-            student_model: Student model (may be None if not needed by strategy).
-            teacher_model: Teacher model (may be None if not needed by strategy).
-            
-        Returns:
-            List of derived image tensors. Caller assigns labels and teacher logits
-            from corresponding source samples.
-        """
+    ) -> Iterable[tuple[int, Tensor]]:
+        """Yield ``(source_position, derived_image)`` for one source batch."""
         raise NotImplementedError
 
 
 class StrictInheritanceStrategy(EnrichmentStrategy):
-    """Base for v1 strategies: returns only image tensors.
-    Executor always inherits label and teacher logits from source sample.
-    Concrete strategies inherit from this class and implement run().
-    """
+    """Base for one-to-one transforms that inherit source labels/logits."""
 
-    def _iter_source_samples(self, subset: Subset) -> Iterable[tuple[int, Tensor]]:
-        """Yield (source_position_in_subset, image_tensor)."""
-        for source_pos in range(len(subset)):
-            item = subset[source_pos]
-            image = item[0]
-            yield source_pos, image
+    @abstractmethod
+    def transform_batch(self, images: Tensor) -> Tensor:
+        """Transform a batch of images (N, C, H, W) on whatever device they are on."""
+        raise NotImplementedError
+
+    def generate_batch(
+        self,
+        *,
+        images: Tensor,
+        labels: Tensor,
+        source_positions: Tensor,
+        student_model: nn.Module | None,
+        teacher_model: nn.Module | None,
+    ) -> Iterable[tuple[int, Tensor]]:
+        del labels, student_model, teacher_model
+        derived = self.transform_batch(images.to(DEVICE)).detach().cpu()
+        for source_pos, image in zip(source_positions, derived, strict=True):
+            yield int(source_pos.item()), image
 
 
 @dataclass(frozen=True)
 class HorizontalFlipStrategy(StrictInheritanceStrategy):
     """Horizontal flip (left-right reflection)."""
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        flip_transform = transforms.RandomHorizontalFlip(p=1.0)
-        return [
-            (source_pos, flip_transform(img))
-            for source_pos, img in self._iter_source_samples(subset)
-        ]
+    def transform_batch(self, images: Tensor) -> Tensor:
+        return transforms.functional.hflip(images)
 
 
 @dataclass(frozen=True)
 class VerticalFlipStrategy(StrictInheritanceStrategy):
     """Vertical flip (top-bottom reflection). Opt-in due to label validity risk."""
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        flip_transform = transforms.RandomVerticalFlip(p=1.0)
-        return [
-            (source_pos, flip_transform(img))
-            for source_pos, img in self._iter_source_samples(subset)
-        ]
+    def transform_batch(self, images: Tensor) -> Tensor:
+        return transforms.functional.vflip(images)
 
 
 @dataclass(frozen=True)
@@ -157,33 +148,19 @@ class ScaleStrategy(StrictInheritanceStrategy):
     factor_min: float = 0.9
     factor_max: float = 1.1
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        result = []
-        for source_pos, img in self._iter_source_samples(subset):
-            # img is shape (C, H, W)
-            factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
-            new_h = max(1, int(img.shape[1] * factor))
-            new_w = max(1, int(img.shape[2] * factor))
-            resizer = transforms.Resize((new_h, new_w))
-            scaled = resizer(img)
-            # Crop back to original size if scaled up, pad back if scaled down
-            if factor > 1.0:
-                restore_transform = transforms.CenterCrop((img.shape[1], img.shape[2]))
-            else:
-                h_pad = img.shape[1] - new_h
-                w_pad = img.shape[2] - new_w
-                top_pad = h_pad // 2
-                left_pad = w_pad // 2
-                restore_transform = transforms.Pad(
-                    (left_pad, top_pad, w_pad - left_pad, h_pad - top_pad)
-                )
-            result.append((source_pos, restore_transform(scaled)))
-        return result
+    def transform_batch(self, images: Tensor) -> Tensor:
+        factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
+        _, _, h, w = images.shape
+        new_h = max(1, int(h * factor))
+        new_w = max(1, int(w * factor))
+        resized = transforms.functional.resize(images, [new_h, new_w])
+        if factor > 1.0:
+            return transforms.functional.center_crop(resized, [h, w])
+        h_pad = h - new_h
+        w_pad = w - new_w
+        top_pad = h_pad // 2
+        left_pad = w_pad // 2
+        return transforms.functional.pad(resized, [left_pad, top_pad, w_pad - left_pad, h_pad - top_pad])
 
 
 @dataclass(frozen=True)
@@ -194,18 +171,9 @@ class GaussianBlurStrategy(StrictInheritanceStrategy):
     sigma_min: float = 0.1
     sigma_max: float = 2.0
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        result = []
-        for source_pos, img in self._iter_source_samples(subset):
-            sigma = torch.empty(1).uniform_(self.sigma_min, self.sigma_max).item()
-            blur = transforms.GaussianBlur(kernel_size=self.kernel_size, sigma=(sigma, sigma))
-            result.append((source_pos, blur(img)))
-        return result
+    def transform_batch(self, images: Tensor) -> Tensor:
+        sigma = torch.empty(1).uniform_(self.sigma_min, self.sigma_max).item()
+        return transforms.functional.gaussian_blur(images, kernel_size=self.kernel_size, sigma=sigma)
 
 
 @dataclass(frozen=True)
@@ -214,17 +182,8 @@ class PerspectiveStrategy(StrictInheritanceStrategy):
 
     distortion_scale: float = 0.2
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        perspective = transforms.RandomPerspective(distortion_scale=self.distortion_scale, p=1.0)
-        return [
-            (source_pos, perspective(img))
-            for source_pos, img in self._iter_source_samples(subset)
-        ]
+    def transform_batch(self, images: Tensor) -> Tensor:
+        return transforms.RandomPerspective(distortion_scale=self.distortion_scale, p=1.0)(images)
 
 
 @dataclass(frozen=True)
@@ -233,118 +192,142 @@ class RotateStrategy(StrictInheritanceStrategy):
 
     angles: tuple[int, ...] = (90, 180, 270)
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        result = []
-        for source_pos, img in self._iter_source_samples(subset):
-            angle = self.angles[torch.randint(0, len(self.angles), (1,)).item()]
-            rotated = transforms.functional.rotate(img, angle)
-            result.append((source_pos, rotated))
-        return result
+    def transform_batch(self, images: Tensor) -> Tensor:
+        angle = self.angles[torch.randint(0, len(self.angles), (1,)).item()]
+        return transforms.functional.rotate(images, angle)
 
 
 @dataclass(frozen=True)
 class GrayscaleStrategy(StrictInheritanceStrategy):
     """Convert to grayscale. Opt-in due to label validity risk in colorful ads."""
 
-    def run(
-        self,
-        subset: Subset,
-        student_model: nn.Module | None,
-        teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        to_gray = transforms.Grayscale(num_output_channels=3)
-        return [
-            (source_pos, to_gray(img))
-            for source_pos, img in self._iter_source_samples(subset)
-        ]
+    def transform_batch(self, images: Tensor) -> Tensor:
+        return transforms.functional.rgb_to_grayscale(images, num_output_channels=3)
 
 
 @dataclass(frozen=True)
-class AdversarialStrategy(StrictInheritanceStrategy):
+class BrightnessStrategy(StrictInheritanceStrategy):
+    """Random brightness adjustment. Simulates screen calibration variance in ad delivery."""
+
+    factor_min: float = 0.6
+    factor_max: float = 1.4
+
+    def transform_batch(self, images: Tensor) -> Tensor:
+        factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
+        return transforms.functional.adjust_brightness(images, factor)
+
+
+@dataclass(frozen=True)
+class ContrastStrategy(StrictInheritanceStrategy):
+    """Random contrast adjustment. Simulates compression artifacts and display variation."""
+
+    factor_min: float = 0.6
+    factor_max: float = 1.4
+
+    def transform_batch(self, images: Tensor) -> Tensor:
+        factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
+        return transforms.functional.adjust_contrast(images, factor)
+
+
+@dataclass(frozen=True)
+class SaturationStrategy(StrictInheritanceStrategy):
+    """Random saturation adjustment. Ads vary heavily in color processing across pipelines."""
+
+    factor_min: float = 0.5
+    factor_max: float = 1.5
+
+    def transform_batch(self, images: Tensor) -> Tensor:
+        factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
+        return transforms.functional.adjust_saturation(images, factor)
+
+
+@dataclass(frozen=True)
+class SharpnessStrategy(StrictInheritanceStrategy):
+    """Random sharpness adjustment. Simulates downscaling and compression in ad delivery."""
+
+    factor_min: float = 0.0
+    factor_max: float = 2.0
+
+    def transform_batch(self, images: Tensor) -> Tensor:
+        factor = torch.empty(1).uniform_(self.factor_min, self.factor_max).item()
+        return transforms.functional.adjust_sharpness(images, factor)
+
+
+@dataclass(frozen=True)
+class RandomErasingStrategy(StrictInheritanceStrategy):
+    """Erase a random rectangle patch. Simulates occlusion in banner and overlay placements."""
+
+    scale_min: float = 0.02
+    scale_max: float = 0.2
+    ratio_min: float = 0.3
+    ratio_max: float = 3.3
+
+    def transform_batch(self, images: Tensor) -> Tensor:
+        eraser = transforms.RandomErasing(
+            p=1.0,
+            scale=(self.scale_min, self.scale_max),
+            ratio=(self.ratio_min, self.ratio_max),
+            value=0,
+        )
+        return torch.stack([eraser(image) for image in images])
+
+
+@dataclass(frozen=True)
+class AdversarialStrategy(EnrichmentStrategy):
     """Adversarial perturbation using PGD attack."""
 
     epsilon: float = 0.05
     steps: int = 5
 
-    def run(
+    def generate_batch(
         self,
-        subset: Subset,
+        *,
+        images: Tensor,
+        labels: Tensor,
+        source_positions: Tensor,
         student_model: nn.Module | None,
         teacher_model: nn.Module | None,
-    ) -> list[tuple[int, Tensor]]:
-        """Generate adversarial samples via PGD attack.
-        
-        Args:
-            subset: Input dataset subset.
-            student_model: Model to attack (required for adversarial).
-            teacher_model: Unused (inherited for interface uniformity).
-            
-        Returns:
-            List of successful adversarial image tensors.
-        """
+    ) -> Iterable[tuple[int, Tensor]]:
+        """Yield successful adversarial samples for one source batch."""
+        del teacher_model
         if student_model is None:
             raise ValueError("AdversarialStrategy requires student_model")
 
-        batch_size = 32
-        adversarial_samples: list[tuple[int, Tensor]] = []
         student_model.eval()
         criterion = nn.CrossEntropyLoss()
 
-        data_loader, = make_data_loader(
-            subset,
-            batch_size=batch_size,
-            shuffle=False,
-            pin_memory=False,
+        images, labels = to_device(images, labels)
+        source_positions = source_positions.to(labels.device)
+
+        with torch.inference_mode():
+            logits = forward_logits(student_model, images)
+            predictions = logits.argmax(dim=1)
+        correct_mask = predictions == labels
+        if not correct_mask.any():
+            return
+
+        correct_images = images[correct_mask]
+        correct_labels = labels[correct_mask]
+        correct_source_positions = source_positions[correct_mask]
+
+        perturbed = generate_budgeted_pgd_perturbation(
+            model=student_model,
+            x_original=correct_images,
+            criterion=criterion,
+            target_labels=correct_labels,
+            strategy=BudgetedPgdStrategy(epsilon=self.epsilon, num_steps=self.steps),
         )
-        seen_count = 0
-        for batch in data_loader:
-            images, labels = batch[0], batch[1]
-            images, labels = to_device(images, labels)
-            batch_len = images.shape[0]
+        with torch.inference_mode():
+            adv_logits = forward_logits(student_model, perturbed)
+            adv_predictions = adv_logits.argmax(dim=1)
+        successful_mask = adv_predictions != correct_labels
 
-            with torch.inference_mode():
-                logits = forward_logits(student_model, images)
-                predictions = logits.argmax(dim=1)
-            correct_mask = predictions == labels
-            if not correct_mask.any():
-                seen_count += batch_len
-                continue
-
-            correct_images = images[correct_mask]
-            correct_labels = labels[correct_mask]
-            source_positions = torch.arange(
-                seen_count,
-                seen_count + batch_len,
-                device=labels.device,
-            )[correct_mask]
-
-            perturbed = generate_budgeted_pgd_perturbation(
-                model=student_model,
-                x_original=correct_images,
-                criterion=criterion,
-                target_labels=correct_labels,
-                strategy=BudgetedPgdStrategy(epsilon=self.epsilon, num_steps=self.steps),
-            )
-            with torch.inference_mode():
-                adv_logits = forward_logits(student_model, perturbed)
-                adv_predictions = adv_logits.argmax(dim=1)
-            successful_mask = adv_predictions != correct_labels
-
-            for image, source_pos in zip(
-                perturbed[successful_mask],
-                source_positions[successful_mask],
-                strict=True,
-            ):
-                adversarial_samples.append((int(source_pos.item()), image.detach().cpu()))
-
-            seen_count += batch_len
-
-        return adversarial_samples
+        for image, source_pos in zip(
+            perturbed[successful_mask],
+            correct_source_positions[successful_mask],
+            strict=True,
+        ):
+            yield int(source_pos.item()), image.detach().cpu()
 
 
 @dataclass(frozen=True)
@@ -359,6 +342,103 @@ class EnrichmentJobSpec:
     """Specification of an enrichment job (sequence of phases to apply)."""
 
     phases: tuple[EnrichmentPhaseSpec, ...]
+    input_replay_fraction: float = 1.0
+
+
+@dataclass(frozen=True)
+class EnrichmentRunReport:
+    input_count: int
+    replayed_input_count: int
+    derived_sample_count: int
+    output_count: int
+    input_replay_fraction: float
+
+
+def _get_subset_teacher_logits(subset: Subset, source_pos: int) -> Tensor | None:
+    source_index = int(subset.indices[source_pos])
+    if hasattr(subset.dataset, "get_teacher_logits"):
+        return subset.dataset.get_teacher_logits(source_index)
+    return None
+
+
+def _select_replay_indices(sample_count: int, replay_fraction: float, seed: int) -> list[int]:
+    if replay_fraction < 0 or replay_fraction > 1:
+        raise ValueError("input_replay_fraction must be in the range [0, 1]")
+    if replay_fraction == 1.0:
+        return list(range(sample_count))
+    if replay_fraction == 0.0:
+        return []
+
+    replay_count = min(sample_count, int(round(sample_count * replay_fraction)))
+    if replay_count <= 0:
+        return []
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    replay_indices = torch.randperm(sample_count, generator=generator)[:replay_count].tolist()
+    replay_indices.sort()
+    return replay_indices
+
+
+def _phase_source_positions(batch_start: int, batch_size: int) -> Tensor:
+    return torch.arange(batch_start, batch_start + batch_size, dtype=torch.long)
+
+
+def _run_enrichment_phase(
+    *,
+    phase_idx: int,
+    strategy: EnrichmentStrategy,
+    subset: Subset,
+    prepared: PreparedTrainingDataset,
+    student_model: nn.Module | None,
+    teacher_model: nn.Module | None,
+    teacher_logits: torch.Tensor | None,
+    batch_size: int = 32,
+) -> int:
+    data_loader, = make_data_loader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=False,
+    )
+    generated_count = 0
+    seen_count = 0
+    strategy_name = strategy.__class__.__name__
+    progress = tqdm(total=len(subset), desc=f"Phase {phase_idx}: {strategy_name}", leave=False)
+    try:
+        for batch in data_loader:
+            images, labels = batch[0], batch[1]
+            current_batch_size = images.shape[0]
+            source_positions = _phase_source_positions(seen_count, current_batch_size)
+            source_labels = {
+                int(source_pos.item()): int(label.item())
+                for source_pos, label in zip(source_positions, labels, strict=True)
+            }
+
+            for source_pos, derived_image in strategy.generate_batch(
+                images=images,
+                labels=labels,
+                source_positions=source_positions,
+                student_model=student_model,
+                teacher_model=teacher_model,
+            ):
+                source_teacher_logits = (
+                    _get_subset_teacher_logits(subset, source_pos)
+                    if teacher_logits is not None
+                    else None
+                )
+                prepared.add_sample(
+                    image=derived_image.detach().cpu(),
+                    label=source_labels[source_pos],
+                    teacher_logits=source_teacher_logits,
+                )
+                generated_count += 1
+
+            seen_count += current_batch_size
+            progress.update(current_batch_size)
+    finally:
+        progress.close()
+
+    return generated_count
 
 
 def run_enrichment_job(
@@ -367,7 +447,9 @@ def run_enrichment_job(
     student_model: nn.Module | None,
     teacher_model: nn.Module | None,
     teacher_logits: torch.Tensor | None,
-) -> PreparedTrainingDataset:
+    *,
+    replay_seed: int,
+) -> tuple[PreparedTrainingDataset, EnrichmentRunReport]:
     """Execute one enrichment job on a dataset subset.
     
     All phases read the same subset snapshot. New samples accumulate.
@@ -383,11 +465,12 @@ def run_enrichment_job(
     Returns:
         PreparedTrainingDataset with original samples + all derived samples.
     """
-    prepared = PreparedTrainingDataset(subset)
+    replay_indices = _select_replay_indices(len(subset), job.input_replay_fraction, replay_seed)
+    prepared = PreparedTrainingDataset(subset, base_indices=replay_indices)
     if teacher_logits is not None and hasattr(subset.dataset, "get_teacher_logits"):
         subset_logits_items: list[Tensor] = []
-        for source_index in subset.indices:
-            source_logits = subset.dataset.get_teacher_logits(int(source_index))
+        for source_pos in replay_indices:
+            source_logits = _get_subset_teacher_logits(subset, source_pos)
             if source_logits is None:
                 subset_logits_items = []
                 break
@@ -395,30 +478,50 @@ def run_enrichment_job(
         if subset_logits_items:
             prepared.set_teacher_logits(torch.stack(subset_logits_items))
 
-    # Process each phase
+    print(
+        "  Replay input samples: "
+        f"{len(replay_indices)}/{len(subset)} "
+        f"(fraction={job.input_replay_fraction:.3f})"
+    )
+
     total_added = 0
     for phase_idx, phase in enumerate(job.phases):
-        phase_samples = phase.strategy.run(subset, student_model, teacher_model)
-        print(f"  Phase {phase_idx}: {phase.strategy.__class__.__name__} generated {len(phase_samples)} samples")
+        generated_count = _run_enrichment_phase(
+            phase_idx=phase_idx,
+            strategy=phase.strategy,
+            subset=subset,
+            prepared=prepared,
+            student_model=student_model,
+            teacher_model=teacher_model,
+            teacher_logits=teacher_logits,
+        )
+        total_added += generated_count
+        print(
+            f"  Phase {phase_idx}: "
+            f"{phase.strategy.__class__.__name__} generated {generated_count} samples"
+        )
+        gc.collect()
+        release_torch_memory()
 
-        for source_pos, derived_image in phase_samples:
-            source_item = subset[source_pos]
-            source_label = int(source_item[1])
-            source_teacher_logits = (
-                prepared.get_teacher_logits(source_pos)
-                if teacher_logits is not None
-                else None
-            )
+    if len(prepared) == 0:
+        raise ValueError("Enrichment job produced an empty training dataset. Increase input_replay_fraction.")
 
-            prepared.add_sample(
-                image=derived_image.detach().cpu(),
-                label=source_label,
-                teacher_logits=source_teacher_logits,
-            )
-            total_added += 1
-
-    print(f"Job enrichment complete: {total_added} samples added")
-    return prepared
+    report = EnrichmentRunReport(
+        input_count=len(subset),
+        replayed_input_count=len(replay_indices),
+        derived_sample_count=total_added,
+        output_count=len(prepared),
+        input_replay_fraction=job.input_replay_fraction,
+    )
+    print(
+        "Job enrichment complete: "
+        f"input={report.input_count}, "
+        f"replayed={report.replayed_input_count}, "
+        f"derived={report.derived_sample_count}, "
+        f"output={report.output_count}, "
+        f"multiplier={report.output_count / max(1, report.input_count):.3f}x"
+    )
+    return prepared, report
 
 
 def run_enrichment_jobs(
@@ -427,7 +530,9 @@ def run_enrichment_jobs(
     student_model: nn.Module | None,
     teacher_model: nn.Module | None,
     teacher_logits: torch.Tensor | None,
-) -> PreparedTrainingDataset:
+    *,
+    replay_seed: int,
+) -> tuple[PreparedTrainingDataset, tuple[EnrichmentRunReport, ...]]:
     """Execute a sequence of enrichment jobs, chaining outputs.
     
     Job N's output becomes job N+1's input.
@@ -444,11 +549,22 @@ def run_enrichment_jobs(
     """
     current: Subset = subset
     result: PreparedTrainingDataset | None = None
+    reports: list[EnrichmentRunReport] = []
     for job_idx, job in enumerate(jobs):
         print(f"\nEnrichment job {job_idx}:")
-        result = run_enrichment_job(job, current, student_model, teacher_model, teacher_logits)
+        result, report = run_enrichment_job(
+            job,
+            current,
+            student_model,
+            teacher_model,
+            teacher_logits,
+            replay_seed=replay_seed + job_idx,
+        )
+        reports.append(report)
         current = Subset(result, list(range(len(result))))
+        gc.collect()
+        release_torch_memory()
 
     if result is None:
-        return PreparedTrainingDataset(subset)
-    return result
+        return PreparedTrainingDataset(subset), ()
+    return result, tuple(reports)

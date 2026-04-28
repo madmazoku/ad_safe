@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,11 +37,53 @@ DEFAULT_ENRICHMENT_PARAMS = {
     "scale": {"factor_min": 0.9, "factor_max": 1.1},
     "gaussian_blur": {"kernel_size": 5, "sigma_min": 0.1, "sigma_max": 2.0},
     "perspective": {"distortion_scale": 0.2},
+    "brightness": {"factor_min": 0.6, "factor_max": 1.4},
+    "contrast": {"factor_min": 0.6, "factor_max": 1.4},
+    "saturation": {"factor_min": 0.5, "factor_max": 1.5},
+    "sharpness": {"factor_min": 0.0, "factor_max": 2.0},
+    "random_erasing": {"scale_min": 0.02, "scale_max": 0.2, "ratio_min": 0.3, "ratio_max": 3.3},
     "adversarial": {"epsilon": 0.05, "steps": 5},
 }
 PHASE_CONFIG_FIELDS = frozenset(DEFAULT_PHASE)
 JOB_META_FIELDS = frozenset({"title"})
 PHASE_META_FIELDS = frozenset({"title"})
+
+
+def slugify_title(value: str) -> str:
+    slug_chars: list[str] = []
+    previous_dash = False
+    for char in value.strip().lower():
+        if char.isalnum():
+            slug_chars.append(char)
+            previous_dash = False
+        elif not previous_dash:
+            slug_chars.append("-")
+            previous_dash = True
+    slug = "".join(slug_chars).strip("-")
+    if not slug:
+        raise ValueError("sweep title must contain at least one letter or number")
+    return slug
+
+
+def sweep_title_from_config(raw: dict[str, Any], config_path: Path) -> str:
+    title_value = raw.get("title", raw.get("sweep_title"))
+    if title_value is None:
+        return slugify_title(config_path.stem)
+    if not isinstance(title_value, str) or not title_value.strip():
+        raise ValueError("title must be a non-empty string when provided")
+    return slugify_title(title_value)
+
+
+def format_run_dir_name(run_id: str, sweep_title: str) -> str:
+    if run_id.endswith(f"_{sweep_title}"):
+        return run_id
+    return f"{run_id}_{sweep_title}"
+
+
+@dataclass(frozen=True)
+class ParsedEnrichmentJobs:
+    specs: tuple[ad_safe.EnrichmentJobSpec, ...]
+    payload: tuple[dict[str, Any], ...]
 
 
 def _make_enrichment_strategy(name: str, params: dict[str, Any]) -> ad_safe.EnrichmentStrategy:
@@ -77,6 +120,36 @@ def _make_enrichment_strategy(name: str, params: dict[str, Any]) -> ad_safe.Enri
         return ad_safe.PerspectiveStrategy(distortion_scale=distortion_scale)
     if strategy_name == "grayscale":
         return ad_safe.GrayscaleStrategy()
+    if strategy_name == "brightness":
+        brightness_defaults = DEFAULT_ENRICHMENT_PARAMS["brightness"]
+        factor_min = float(params.get("factor_min", brightness_defaults["factor_min"]))
+        factor_max = float(params.get("factor_max", brightness_defaults["factor_max"]))
+        return ad_safe.BrightnessStrategy(factor_min=factor_min, factor_max=factor_max)
+    if strategy_name == "contrast":
+        contrast_defaults = DEFAULT_ENRICHMENT_PARAMS["contrast"]
+        factor_min = float(params.get("factor_min", contrast_defaults["factor_min"]))
+        factor_max = float(params.get("factor_max", contrast_defaults["factor_max"]))
+        return ad_safe.ContrastStrategy(factor_min=factor_min, factor_max=factor_max)
+    if strategy_name == "saturation":
+        saturation_defaults = DEFAULT_ENRICHMENT_PARAMS["saturation"]
+        factor_min = float(params.get("factor_min", saturation_defaults["factor_min"]))
+        factor_max = float(params.get("factor_max", saturation_defaults["factor_max"]))
+        return ad_safe.SaturationStrategy(factor_min=factor_min, factor_max=factor_max)
+    if strategy_name == "sharpness":
+        sharpness_defaults = DEFAULT_ENRICHMENT_PARAMS["sharpness"]
+        factor_min = float(params.get("factor_min", sharpness_defaults["factor_min"]))
+        factor_max = float(params.get("factor_max", sharpness_defaults["factor_max"]))
+        return ad_safe.SharpnessStrategy(factor_min=factor_min, factor_max=factor_max)
+    if strategy_name == "random_erasing":
+        erasing_defaults = DEFAULT_ENRICHMENT_PARAMS["random_erasing"]
+        scale_min = float(params.get("scale_min", erasing_defaults["scale_min"]))
+        scale_max = float(params.get("scale_max", erasing_defaults["scale_max"]))
+        ratio_min = float(params.get("ratio_min", erasing_defaults["ratio_min"]))
+        ratio_max = float(params.get("ratio_max", erasing_defaults["ratio_max"]))
+        return ad_safe.RandomErasingStrategy(
+            scale_min=scale_min, scale_max=scale_max,
+            ratio_min=ratio_min, ratio_max=ratio_max,
+        )
     if strategy_name == "adversarial":
         adv_defaults = DEFAULT_ENRICHMENT_PARAMS["adversarial"]
         epsilon = float(params.get("epsilon", adv_defaults["epsilon"]))
@@ -87,25 +160,30 @@ def _make_enrichment_strategy(name: str, params: dict[str, Any]) -> ad_safe.Enri
     raise ValueError(
         "Unknown enrichment strategy: "
         f"{name}. Supported: horizontal_flip, vertical_flip, rotate, scale, gaussian_blur, "
-        "perspective, grayscale, adversarial"
+        "perspective, grayscale, brightness, contrast, saturation, sharpness, random_erasing, adversarial"
     )
 
 
-def parse_enrichment_jobs(value: Any, *, context: str) -> tuple[ad_safe.EnrichmentJobSpec, ...]:
+def parse_enrichment_jobs(value: Any, *, context: str) -> ParsedEnrichmentJobs:
     if value is None:
-        return ()
+        return ParsedEnrichmentJobs(specs=(), payload=())
     if not isinstance(value, list):
         raise ValueError(f"{context} must be a list")
 
     jobs: list[ad_safe.EnrichmentJobSpec] = []
+    payload_jobs: list[dict[str, Any]] = []
     for job_index, job_value in enumerate(value):
         if not isinstance(job_value, dict):
             raise ValueError(f"{context}[{job_index}] must be an object")
+        replay_fraction = float(job_value.get("input_replay_fraction", 1.0))
+        if replay_fraction < 0 or replay_fraction > 1:
+            raise ValueError(f"{context}[{job_index}].input_replay_fraction must be in the range [0, 1]")
         phases_value = job_value.get("phases")
         if not isinstance(phases_value, list) or not phases_value:
             raise ValueError(f"{context}[{job_index}].phases must be a non-empty list")
 
         phases: list[ad_safe.EnrichmentPhaseSpec] = []
+        phase_payloads: list[dict[str, Any]] = []
         for phase_index, phase_value in enumerate(phases_value):
             if not isinstance(phase_value, dict):
                 raise ValueError(f"{context}[{job_index}].phases[{phase_index}] must be an object")
@@ -117,15 +195,33 @@ def parse_enrichment_jobs(value: Any, *, context: str) -> tuple[ad_safe.Enrichme
             params = phase_value.get("params", {})
             if not isinstance(params, dict):
                 raise ValueError(f"{context}[{job_index}].phases[{phase_index}].params must be an object")
+            normalized_strategy = strategy_name.strip().lower()
             phases.append(
                 ad_safe.EnrichmentPhaseSpec(
-                    strategy=_make_enrichment_strategy(strategy_name, params),
+                    strategy=_make_enrichment_strategy(normalized_strategy, params),
                 )
             )
+            phase_payloads.append(
+                {
+                    "strategy": normalized_strategy,
+                    "params": params,
+                }
+            )
 
-        jobs.append(ad_safe.EnrichmentJobSpec(phases=tuple(phases)))
+        jobs.append(
+            ad_safe.EnrichmentJobSpec(
+                phases=tuple(phases),
+                input_replay_fraction=replay_fraction,
+            )
+        )
+        payload_jobs.append(
+            {
+                "input_replay_fraction": replay_fraction,
+                "phases": phase_payloads,
+            }
+        )
 
-    return tuple(jobs)
+    return ParsedEnrichmentJobs(specs=tuple(jobs), payload=tuple(payload_jobs))
 
 
 def parse_args() -> argparse.Namespace:
@@ -353,8 +449,18 @@ def build_training_config(backbone: str, values: dict[str, Any]) -> ad_safe.Trai
 
 
 def build_job_specs(backbone: str, raw: dict[str, Any], *, config_dir: Path) -> tuple[ad_safe.JobSpec, ...]:
-    defaults = {**DEFAULT_PHASE, **get_object(raw, "defaults")}
-    ensure_no_unknown_phase_fields(defaults, context="defaults")
+    defaults_payload = get_object(raw, "defaults")
+    default_phase_overrides = {
+        key: value
+        for key, value in defaults_payload.items()
+        if key != "enrichment_jobs"
+    }
+    defaults = {**DEFAULT_PHASE, **default_phase_overrides}
+    ensure_no_unknown_phase_fields(default_phase_overrides, context="defaults")
+    default_enrichment_jobs = parse_enrichment_jobs(
+        defaults_payload.get("enrichment_jobs"),
+        context="defaults.enrichment_jobs",
+    )
 
     jobs_value = raw.get("jobs")
     if not isinstance(jobs_value, list) or not jobs_value:
@@ -374,7 +480,7 @@ def build_job_specs(backbone: str, raw: dict[str, Any], *, config_dir: Path) -> 
         job_enrichment_jobs = parse_enrichment_jobs(
             job_value.get("enrichment_jobs"),
             context=f"jobs[{job_index}].enrichment_jobs",
-        )
+        ) if "enrichment_jobs" in job_value else default_enrichment_jobs
         phases_value = job_value.get("phases")
         if not isinstance(phases_value, list) or not phases_value:
             raise ValueError(f"jobs[{job_index}].phases must be a non-empty list")
@@ -390,13 +496,17 @@ def build_job_specs(backbone: str, raw: dict[str, Any], *, config_dir: Path) -> 
             phase_overrides = {
                 key: value
                 for key, value in phase_value.items()
-                if key not in PHASE_META_FIELDS
+                if key not in {"enrichment_jobs", *PHASE_META_FIELDS}
             }
             ensure_no_unknown_phase_fields(phase_overrides, context=f"jobs[{job_index}].phases[{phase_index}]")
             values = {**defaults, **job_overrides, **phase_overrides}
             if not isinstance(values["unfreeze_all"], bool):
                 raise ValueError("unfreeze_all must be a boolean")
             requested_seed = normalize_requested_seed(values["seed"])
+            phase_enrichment_jobs = parse_enrichment_jobs(
+                phase_value.get("enrichment_jobs"),
+                context=f"jobs[{job_index}].phases[{phase_index}].enrichment_jobs",
+            ) if "enrichment_jobs" in phase_value else job_enrichment_jobs
             values["teacher_model_path"] = normalize_teacher_model_path(
                 values["teacher_model_path"],
                 config_dir=config_dir,
@@ -412,11 +522,14 @@ def build_job_specs(backbone: str, raw: dict[str, Any], *, config_dir: Path) -> 
                     requested_seed=requested_seed,
                     config=training_config,
                     unfreeze_all=bool(values["unfreeze_all"]),
+                    enrichment_jobs=phase_enrichment_jobs.specs,
+                    enrichment_jobs_payload=phase_enrichment_jobs.payload,
                     signature={
                         "builder": "sweep",
                         "backbone": backbone,
                         "job_index": job_index,
                         "phase_index": phase_index,
+                        "resolved_enrichment_jobs": list(phase_enrichment_jobs.payload),
                     },
                 )
             )
@@ -427,7 +540,8 @@ def build_job_specs(backbone: str, raw: dict[str, Any], *, config_dir: Path) -> 
                 title=job_title,
                 backbone=backbone,
                 phases=tuple(phases),
-                enrichment_jobs=job_enrichment_jobs,
+                enrichment_jobs=job_enrichment_jobs.specs,
+                metadata={"resolved_enrichment_jobs": list(job_enrichment_jobs.payload)},
             )
         )
     return tuple(jobs)
@@ -446,8 +560,9 @@ def build_run_plan(config_arg: Path, run_id_override: str | None = None) -> tupl
     output_root = (
         resolve_config_relative_path(raw["output_root"], config_dir=config_dir, field_name="output_root")
         if "output_root" in raw
-        else ad_safe.ARTEFACTS_DIR / f"prod_{backbone}_model"
+        else ad_safe.PROD_MODELS_DIR
     )
+    sweep_title = sweep_title_from_config(raw, config_path)
     if run_id_override is not None:
         run_id = run_id_override.strip()
         if not run_id:
@@ -467,7 +582,7 @@ def build_run_plan(config_arg: Path, run_id_override: str | None = None) -> tupl
     train_fraction = validate_fraction(raw.get("train_fraction", 1.0), field_name="train_fraction")
     eval_splits = normalize_eval_splits(raw.get("eval_splits"))
     validate_dataset_splits(train_split, eval_splits)
-    output_dir = output_root / run_id
+    output_dir = output_root / format_run_dir_name(run_id, sweep_title)
 
     return (
         config_path,
@@ -492,6 +607,7 @@ def build_run_plan(config_arg: Path, run_id_override: str | None = None) -> tupl
             metadata={
                 "builder": "sweep",
                 "backbone": backbone,
+                "sweep_title": sweep_title,
                 "train_fraction": train_fraction,
                 "raw_config": raw,
             },

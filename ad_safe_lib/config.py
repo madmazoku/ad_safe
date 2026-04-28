@@ -256,8 +256,10 @@ def resolve_effective_seed(seed_value: object) -> int:
         return make_seed()
     if not isinstance(seed_value, int):
         raise ValueError("seed must be an integer or null")
-    if seed_value <= 0:
-        raise ValueError("seed must be a positive integer or null")
+    if seed_value == 0:
+        return make_seed()
+    if seed_value < 0:
+        raise ValueError("seed must be a non-negative integer or null")
     return seed_value
 
 

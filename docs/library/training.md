@@ -18,7 +18,9 @@ result = ad_safe.run_training_plan(plan)
 
 Teacher distillation is controlled by `teacher_model_path`, `distillation_alpha`, and `distillation_temperature`. 
 
-Data augmentation uses enrichment jobs specified separately in the `JobSpec`. Enrichment jobs can apply multiple strategies (e.g., adversarial perturbation, geometric transforms) to generate synthetic training samples. The enrichment pipeline is decoupled from the core training config.
+Data augmentation uses enrichment jobs attached to `PhaseSpec`. Enrichment jobs can apply multiple strategies (for example adversarial perturbation or geometric transforms) to generate synthetic training samples for each train/validation resplit. The enrichment pipeline is decoupled from `TrainingConfig`.
+
+Enrichment runners own dataset iteration and progress reporting. A strategy receives a source batch and yields `(source_position, derived_image)` pairs through `generate_batch(...)`; simple one-to-one strategies inherit `StrictInheritanceStrategy` and implement `transform_sample(image)`. The runner attaches inherited labels and teacher logits to derived samples.
 
 `generate_adversarial_perturbation(...)` accepts an attack strategy object:
 

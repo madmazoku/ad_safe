@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import gc
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 from torch import Tensor, nn, optim
@@ -16,7 +15,7 @@ from .artifacts import load_model, release_torch_memory, save_model
 from .backbones import forward_logits
 from .config import CLASS_NAMES, DEFAULT_ADV_STEPS, DEVICE, TrainingConfig, TrainingHistoryEntry, get_learning_rate_for_split
 from .cooldown import EpochEndHandler
-from .data import LabeledDatasetView, PreparedTrainingDataset, make_data_loader, split_train_dataset, to_device
+from .data import DatasetSourceSpec, LabeledDatasetView, PreparedTrainingDataset, make_data_loader, split_train_dataset, to_device
 from .enrichment import EnrichmentJobSpec, run_enrichment_jobs
 from .metrics import DefaultValidationMetricComparator, ValidationComparison, evaluate_validation_score
 
@@ -98,26 +97,57 @@ def precompute_teacher_logits(
             logits_batches.append(logits.detach())
 
     del teacher_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    release_torch_memory()
 
     if not logits_batches:
         raise ValueError("Cannot precompute teacher logits for an empty training dataset")
-    return torch.cat(logits_batches, dim=0).to(DEVICE)
+    return torch.cat(logits_batches, dim=0).cpu()
+
+
+def build_teacher_logits_cache_key(
+    *,
+    teacher_model_path: str | None,
+    train_source: DatasetSourceSpec | None,
+    dataset: Dataset,
+) -> tuple[Any, ...] | None:
+    if teacher_model_path is None:
+        return None
+    source_name = train_source.name if train_source is not None else dataset.__class__.__name__
+    source_fraction = train_source.fraction if train_source is not None else 1.0
+    source_seed = train_source.seed if train_source is not None and source_fraction < 1.0 else None
+    return (
+        str(Path(teacher_model_path).resolve()),
+        source_name,
+        float(source_fraction),
+        source_seed,
+        len(dataset),
+    )
 
 
 def prepare_training_dataset(
     *,
     full_train_dataset: Dataset,
     config: TrainingConfig,
+    teacher_logits_cache: dict[tuple[Any, ...], Tensor] | None = None,
+    teacher_logits_cache_key: tuple[Any, ...] | None = None,
 ) -> PreparedTrainingDataset:
     prepared_dataset = PreparedTrainingDataset(full_train_dataset)
-    teacher_logits = precompute_teacher_logits(
-        teacher_model_path=config.teacher_model_path,
-        dataset=full_train_dataset,
-        batch_size=config.batch_size,
-    )
+    teacher_logits: Tensor | None
+    if teacher_logits_cache is not None and teacher_logits_cache_key is not None and teacher_logits_cache_key in teacher_logits_cache:
+        teacher_logits = teacher_logits_cache[teacher_logits_cache_key]
+        print(f"Reusing teacher logits cache: {config.teacher_model_path}")
+    else:
+        teacher_logits = precompute_teacher_logits(
+            teacher_model_path=config.teacher_model_path,
+            dataset=full_train_dataset,
+            batch_size=config.batch_size,
+        )
+        if (
+            teacher_logits is not None
+            and teacher_logits_cache is not None
+            and teacher_logits_cache_key is not None
+        ):
+            teacher_logits_cache[teacher_logits_cache_key] = teacher_logits
     prepared_dataset.set_teacher_logits(teacher_logits)
 
     if teacher_logits is not None:
@@ -592,11 +622,16 @@ def train_model_across_resplits(
     epoch_end_handlers: tuple[EpochEndHandler, ...] = (),
     enrichment_jobs: tuple[EnrichmentJobSpec, ...] = (),
     teacher_model: nn.Module | None = None,
+    replay_seed: int = 0,
+    teacher_logits_cache: dict[tuple[Any, ...], Tensor] | None = None,
+    teacher_logits_cache_key: tuple[Any, ...] | None = None,
 ) -> tuple[nn.Module, list[TrainingHistoryEntry]]:
     criterion = nn.CrossEntropyLoss() if criterion is None else criterion
     prepared_train_dataset = prepare_training_dataset(
         full_train_dataset=full_train_dataset,
         config=config,
+        teacher_logits_cache=teacher_logits_cache,
+        teacher_logits_cache_key=teacher_logits_cache_key,
     )
     training_start_time = time.time() if training_start_time is None else training_start_time
     history: list[TrainingHistoryEntry] = []
@@ -614,25 +649,31 @@ def train_model_across_resplits(
             # Apply enrichment to train_dataset if configured
             if enrichment_jobs:
                 print(f"Applying enrichment with {len(enrichment_jobs)} jobs...")
-                enriched_train_dataset = run_enrichment_jobs(
+                enriched_train_dataset, enrichment_reports = run_enrichment_jobs(
                     jobs=enrichment_jobs,
                     subset=train_dataset,
                     student_model=model,
                     teacher_model=teacher_model,
                     teacher_logits=prepared_train_dataset.teacher_logits,
+                    replay_seed=replay_seed,
                 )
                 train_dataset = enriched_train_dataset
+                if enrichment_reports:
+                    final_report = enrichment_reports[-1]
+                    print(
+                        "Resolved train dataset after enrichment: "
+                        f"input={final_report.input_count}, "
+                        f"replayed={final_report.replayed_input_count}, "
+                        f"derived={final_report.derived_sample_count}, "
+                        f"final={final_report.output_count}, "
+                        f"host_multiplier={final_report.output_count / max(1, final_report.input_count):.3f}x"
+                    )
 
             train_loader, = make_data_loader(
                 train_dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
-                pin_memory=(
-                    False
-                    if prepared_train_dataset.teacher_logits is not None
-                    and prepared_train_dataset.teacher_logits.device.type == "cuda"
-                    else None
-                ),
+                pin_memory=None,
             )
             val_loader, = make_data_loader(
                 LabeledDatasetView(val_dataset),
@@ -675,7 +716,6 @@ def train_model_across_resplits(
                 del val_dataset
             if "test_dataset" in locals():
                 del test_dataset
-            gc.collect()
             release_torch_memory()
 
     return model, history

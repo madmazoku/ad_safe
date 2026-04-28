@@ -8,19 +8,12 @@ import torch
 from torch import Tensor, nn
 from torch.fx import Graph, GraphModule
 from torchvision import transforms
-from torchvision.models import Inception_V3_Weights
-
 from .config import CLASS_NAMES, IMAGE_SIZE
 
 
-DEFAULT_MODEL_WEIGHTS = Inception_V3_Weights.IMAGENET1K_V1
-MODEL_PREPROCESS = DEFAULT_MODEL_WEIGHTS.transforms()
-IMAGENET_MEAN = tuple(float(value) for value in MODEL_PREPROCESS.mean)
-IMAGENET_STD = tuple(float(value) for value in MODEL_PREPROCESS.std)
-NORMALIZE_TRANSFORM = transforms.Normalize(
-    mean=MODEL_PREPROCESS.mean,
-    std=MODEL_PREPROCESS.std,
-)
+IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
+IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
+NORMALIZE_TRANSFORM = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 HF_CLIP_VIT_L_14_MODEL_ID = "openai/clip-vit-large-patch14"
